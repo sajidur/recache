@@ -1,6 +1,8 @@
 # Recache
 
-An in-memory, Redis-protocol-compatible cache server written in C# (.NET 10), speaking RESP2 over TCP so existing Redis clients (`redis-cli`, StackExchange.Redis, RedisInsight, etc.) can talk to it directly.
+A lightweight, Redis-compatible in-memory data store built for Windows developers who want the Redis development experience without the complexity of setting up Redis through WSL, Docker, or other workarounds.
+
+It speaks RESP2 over TCP, so existing Redis clients (`redis-cli`, StackExchange.Redis, RedisInsight, etc.) can talk to it directly.
 
 ```
                          ┌──────────────────────┐
