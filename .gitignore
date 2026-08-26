@@ -1,0 +1,16 @@
+# Build outputs
+bin/
+obj/
+recache/publish/
+installer/Output/
+
+# Visual Studio
+.vs/
+*.user
+
+# Local config may contain real credentials — ship the redacted
+# appsettings.example.yaml instead and let each environment supply
+# its own appsettings.yaml.
+recache/appsettings.yaml
+recache/appsettings.*.yaml
+!recache/appsettings.example.yaml

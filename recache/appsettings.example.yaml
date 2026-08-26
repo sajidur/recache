@@ -1,0 +1,15 @@
+# Copy this file to appsettings.yaml and set a real password before
+# running recache. appsettings.yaml is gitignored on purpose so a
+# real credential never ends up committed.
+Recache:
+  Host: "0.0.0.0"
+  Port: 6380
+  MaxConnections: 10000
+  MaxRequestBytes: 16777216
+  MaxValueBytes: 8388608
+  MaxMemoryBytes: 4294967296
+  RequireAuth: true
+  Password: "CHANGE_THIS"
+  EnableAof: true
+  AofPath: "/data/appendonly.aof"
+  DatabaseCount: 16
