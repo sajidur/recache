@@ -29,5 +29,16 @@ namespace recache.Configuration
                 "/data/appendonly.aof";
 
             public int DatabaseCount { get; set; } = 16;
+
+            public bool EnableFileLogging { get; set; } = true;
+
+            // Relative paths resolve against the content root (the
+            // executable's own folder for a Windows Service or
+            // container, the project folder for `dotnet run`).
+            public string LogDirectory { get; set; } = "logs";
+
+            // One log file per day; files older than this are
+            // deleted automatically.
+            public int LogRetentionDays { get; set; } = 7;
         }
     }

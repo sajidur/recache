@@ -13,3 +13,6 @@ Recache:
   EnableAof: true
   AofPath: "/data/appendonly.aof"
   DatabaseCount: 16
+  EnableFileLogging: true
+  LogDirectory: "logs"
+  LogRetentionDays: 7

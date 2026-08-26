@@ -11,9 +11,13 @@ services:
       # Recache__<Property> maps to the "Recache" section's property.
       Recache__RequireAuth: "true"
       Recache__Password: "changeme" # change this before real use
+    volumes:
+      - recache-logs:/app/logs
+
+      # To use a real config file instead of environment variables,
+      # comment out the environment block above and mount one:
+      # - ./appsettings.yaml:/app/appsettings.yaml:ro
     restart: unless-stopped
 
-    # To use a real config file instead of environment variables,
-    # comment out the environment block above and mount one instead:
-    # volumes:
-    #   - ./appsettings.yaml:/app/appsettings.yaml:ro
+volumes:
+  recache-logs:

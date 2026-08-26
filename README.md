@@ -48,6 +48,7 @@ It speaks RESP2 over TCP, so existing Redis clients (`redis-cli`, StackExchange.
 - **Expiration**: `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `PERSIST`
 - **Auth**: password-based `AUTH`, matching real Redis's `NOAUTH`/`WRONGPASS` semantics
 - **RedisInsight-compatible**: `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`, `INFO`, `CONFIG GET`, `CLIENT`, `MODULE LIST`
+- **Logging**: rolling daily log files with automatic retention, alongside console output
 - Runs as a normal console app or as a Windows Service
 
 ---
@@ -79,6 +80,15 @@ Start-Service Recache
 
 **To uninstall**, use "Apps & Features" / "Programs and Features" in Windows — it cleanly stops and removes the service along with the files.
 
+**Logs** live in a `logs\` folder next to the executable (`C:\Program Files\Recache\logs\` for an installed service), one file per day (`recache-20260826.log`), with old files deleted automatically once there are more than `LogRetentionDays` (default 7). Console output is unaffected — you still see logs there too when running interactively. Adjust in `appsettings.yaml`:
+
+```yaml
+Recache:
+  EnableFileLogging: true
+  LogDirectory: "logs"     # relative to the install folder, or an absolute path
+  LogRetentionDays: 7
+```
+
 ### Docker (Windows, macOS, or Linux)
 
 Prefer a container instead of the Windows installer? The image is on [Docker Hub](https://hub.docker.com/r/sajidur/recache):
@@ -96,7 +106,7 @@ Or with Compose — grab [docker-compose.yml](docker-compose.yml), edit the pass
 docker compose up -d
 ```
 
-Configuration is via `Recache__<Property>` environment variables (`Recache__Port`, `Recache__MaxMemoryBytes`, etc.), or mount your own `appsettings.yaml` to `/app/appsettings.yaml` instead — see the comments in `docker-compose.yml`.
+Configuration is via `Recache__<Property>` environment variables (`Recache__Port`, `Recache__MaxMemoryBytes`, etc.), or mount your own `appsettings.yaml` to `/app/appsettings.yaml` instead — see the comments in `docker-compose.yml`. Logs go to `/app/logs` inside the container; the Compose file mounts a named volume there so they survive container recreation.
 
 ---
 

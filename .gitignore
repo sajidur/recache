@@ -435,3 +435,6 @@ installer/Output/
 recache/appsettings.yaml
 recache/appsettings.*.yaml
 !recache/appsettings.example.yaml
+
+# Runtime log output
+recache/logs/
