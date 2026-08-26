@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+recache/publish/
+installer/
+scripts/
+.git/
+.vs/
+*.md
+LICENSE
+
+# Never let a real, credential-bearing config into a build context
+# that ends up baked into an image layer and pushed to a registry.
+recache/appsettings.yaml
+recache/appsettings.*.yaml

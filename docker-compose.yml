@@ -1,0 +1,19 @@
+services:
+  recache:
+    image: sajidur/recache:latest
+    # Uncomment to build from source instead of pulling the image:
+    # build: .
+    container_name: recache
+    ports:
+      - "6380:6380"
+    environment:
+      # Config binds via the standard ASP.NET Core convention:
+      # Recache__<Property> maps to the "Recache" section's property.
+      Recache__RequireAuth: "true"
+      Recache__Password: "changeme" # change this before real use
+    restart: unless-stopped
+
+    # To use a real config file instead of environment variables,
+    # comment out the environment block above and mount one instead:
+    # volumes:
+    #   - ./appsettings.yaml:/app/appsettings.yaml:ro

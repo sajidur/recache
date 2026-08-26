@@ -79,6 +79,25 @@ Start-Service Recache
 
 **To uninstall**, use "Apps & Features" / "Programs and Features" in Windows — it cleanly stops and removes the service along with the files.
 
+### Docker (Windows, macOS, or Linux)
+
+Prefer a container instead of the Windows installer? The image is on [Docker Hub](https://hub.docker.com/r/sajidur/recache):
+
+```bash
+docker run -d --name recache -p 6380:6380 \
+  -e Recache__RequireAuth=true \
+  -e Recache__Password=yourpassword \
+  sajidur/recache:latest
+```
+
+Or with Compose — grab [docker-compose.yml](docker-compose.yml), edit the password in it, then:
+
+```bash
+docker compose up -d
+```
+
+Configuration is via `Recache__<Property>` environment variables (`Recache__Port`, `Recache__MaxMemoryBytes`, etc.), or mount your own `appsettings.yaml` to `/app/appsettings.yaml` instead — see the comments in `docker-compose.yml`.
+
 ---
 
 ## For developers
@@ -107,6 +126,8 @@ recache/
   Configuration/    RecacheOptions bound from appsettings.yaml
 scripts/            install-service.ps1 / uninstall-service.ps1 — for local dev/test service installs
 installer/          Inno Setup script (recache.iss) that builds the distributable installer
+.github/workflows/  CI: builds and pushes the Docker image on version tags
+Dockerfile, docker-compose.yml, .dockerignore
 ```
 
 ### Building a Release build
@@ -135,6 +156,17 @@ dotnet publish -c Release -o publish
 ```
 
 Produces `installer\Output\RecacheSetup.exe`. It's unsigned by default — if you have a code-signing certificate, sign both `recache\publish\recache.exe` and the compiled installer with `signtool.exe` before distributing; without a certificate from a recognized CA, expect SmartScreen/AV false positives on other machines (self-signing only helps machines that explicitly import your certificate).
+
+### Docker
+
+```bash
+docker build -t recache .
+docker run -d -p 6380:6380 -e Recache__RequireAuth=true -e Recache__Password=devpass recache
+```
+
+The container needs no config file present — `RecacheOptions` has safe built-in defaults (auth disabled, port 6380), and `Recache__<Property>` environment variables override them. `.dockerignore` deliberately excludes `appsettings.yaml` so a real local password can never end up baked into an image layer.
+
+**Publishing to Docker Hub** happens via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) rather than a local build — GitHub's hosted runners have Docker built in, so this works even without Docker installed locally. It fires on any `v*.*.*` tag push (or manually via the Actions tab) and pushes `sajidur/recache:<version>` and `:latest`. One-time setup: add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token, not your password — generate one at hub.docker.com/settings/security) as repo secrets under Settings → Secrets and variables → Actions.
 
 ### License
 

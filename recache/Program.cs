@@ -21,9 +21,13 @@ var builder =
         ContentRootPath = AppContext.BaseDirectory,
     });
 
+// Optional: containers commonly configure entirely via environment
+// variables (Recache__Password, Recache__RequireAuth, etc. — the
+// Generic Host wires those up automatically) rather than a mounted
+// or baked-in config file.
 builder.Configuration.AddYamlFile(
     "appsettings.yaml",
-    optional: false,
+    optional: true,
     reloadOnChange: true);
 
 builder.Configuration.AddYamlFile(
@@ -84,6 +88,15 @@ if (startupOptions.RequireAuth &&
         "placeholder 'CHANGE_THIS'. Set a real password in " +
         "appsettings.yaml (or override it via configuration) " +
         "before exposing this server.");
+}
+else if (startupOptions.RequireAuth &&
+    string.IsNullOrEmpty(startupOptions.Password))
+{
+    logger.LogWarning(
+        "Recache:RequireAuth is true but no password is set, " +
+        "so AUTH is effectively disabled. Set Recache:Password " +
+        "(or the Recache__Password environment variable) to " +
+        "actually require authentication.");
 }
 
 // host.RunAsync() drives the IHostedService lifecycle and fires
