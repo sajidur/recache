@@ -69,6 +69,11 @@ namespace recache.Protocol
                     WriteRaw(buffer, "$-1\r\n");
                     break;
 
+                case RespType.NullArray:
+
+                    WriteRaw(buffer, "*-1\r\n");
+                    break;
+
                 case RespType.BulkString:
 
                     var data = value.BinaryValue!;

@@ -8,6 +8,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading;
 
 namespace recache.Commands
 {
@@ -18,6 +19,41 @@ namespace recache.Commands
         private readonly RecacheOptions _options;
         private readonly string _runId;
         private readonly DateTimeOffset _startedAt;
+
+        // Every command normally takes the read lock — many can run
+        // concurrently, matching today's behaviour. EXEC takes the
+        // write lock for its whole batch, giving transactions real
+        // atomicity against other connections despite this server
+        // not being single-threaded like real Redis.
+        //
+        // Safe only because every command handler below completes
+        // synchronously (ValueTask.FromResult, no real await) — the
+        // lock is always entered and exited on the same thread. If
+        // a command ever needs genuine async I/O, this needs an
+        // async-aware lock instead of ReaderWriterLockSlim.
+        private readonly ReaderWriterLockSlim _executionLock =
+            new(LockRecursionPolicy.NoRecursion);
+
+        private static readonly HashSet<string> KnownCommands =
+            new(StringComparer.Ordinal)
+            {
+                "PING", "GET", "SET", "SETEX", "PSETEX", "SETNX",
+                "STRLEN", "GETRANGE", "SETRANGE", "APPEND", "DEL",
+                "EXISTS", "INCR", "DECR", "INFO", "CLIENT", "CONFIG",
+                "COMMAND", "SELECT", "DBSIZE", "ECHO", "SCAN",
+                "HSCAN", "SSCAN", "ZSCAN", "TYPE", "TTL", "PTTL",
+                "EXPIRE", "PEXPIRE", "PERSIST", "HSET", "HGET",
+                "HGETALL", "HDEL", "HEXISTS", "HLEN", "HKEYS",
+                "HVALS", "HMGET", "LPUSH", "RPUSH", "LRANGE", "LLEN",
+                "LPOP", "RPOP", "LREM", "LSET", "LINDEX", "SADD",
+                "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "ZADD",
+                "ZREM", "ZSCORE", "ZRANGE", "ZCARD", "ZRANK",
+                "MODULE", "JSON.SET", "JSON.GET", "JSON.DEL",
+                "JSON.FORGET", "JSON.TYPE", "JSON.OBJKEYS",
+                "JSON.STRLEN", "JSON.ARRLEN", "JSON.OBJLEN",
+                "JSON.ARRAPPEND", "JSON.NUMINCRBY", "AUTH", "MULTI",
+                "EXEC", "DISCARD", "WATCH", "UNWATCH",
+            };
 
         public CommandDispatcher(
             ICacheStore store,
@@ -66,6 +102,58 @@ namespace recache.Commands
                         "NOAUTH Authentication required."));
             }
 
+            switch (command)
+            {
+                case "MULTI":
+                    return HandleMulti(session);
+
+                case "EXEC":
+                    return HandleExec(session);
+
+                case "DISCARD":
+                    return HandleDiscard(session);
+
+                case "WATCH":
+                    return HandleWatch(args, session);
+
+                case "UNWATCH":
+                    session.WatchedKeys.Clear();
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+            }
+
+            if (session.InTransaction)
+            {
+                if (!KnownCommands.Contains(command))
+                {
+                    session.TransactionDirty = true;
+                    return Error($"ERR unknown command '{command}'");
+                }
+
+                session.QueuedCommands.Add(request);
+
+                return ValueTask.FromResult(
+                    RespValue.Simple("QUEUED"));
+            }
+
+            _executionLock.EnterReadLock();
+
+            try
+            {
+                return DispatchAsync(command, args);
+            }
+            finally
+            {
+                _executionLock.ExitReadLock();
+            }
+        }
+
+        // MULTI/EXEC bookkeeping aside, this is identical to the
+        // body ExecuteAsync used to run directly — EXEC re-enters it
+        // once per queued command while holding the write lock.
+        private ValueTask<RespValue> DispatchAsync(
+            string command,
+            IReadOnlyList<RespValue> args)
+        {
             try
             {
                 return command switch
@@ -232,6 +320,135 @@ namespace recache.Commands
             catch (JsonPathException ex)
             {
                 return Error($"ERR {ex.Message}");
+            }
+        }
+
+        private static ValueTask<RespValue> HandleMulti(
+            ClientSession session)
+        {
+            if (session.InTransaction)
+                return Error("ERR MULTI calls can not be nested");
+
+            session.InTransaction = true;
+            session.TransactionDirty = false;
+            session.QueuedCommands.Clear();
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private static ValueTask<RespValue> HandleDiscard(
+            ClientSession session)
+        {
+            if (!session.InTransaction)
+                return Error("ERR DISCARD without MULTI");
+
+            session.InTransaction = false;
+            session.TransactionDirty = false;
+            session.QueuedCommands.Clear();
+            session.WatchedKeys.Clear();
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private ValueTask<RespValue> HandleWatch(
+            IReadOnlyList<RespValue> args,
+            ClientSession session)
+        {
+            if (args.Count < 2)
+            {
+                return Error(
+                    "ERR wrong number of arguments " +
+                    "for 'watch' command");
+            }
+
+            if (session.InTransaction)
+                return Error("ERR WATCH inside MULTI is not allowed");
+
+            for (var i = 1; i < args.Count; i++)
+            {
+                var key = GetString(args[i]);
+
+                session.WatchedKeys[key] =
+                    _store.TryGetVersion(key, out var version)
+                        ? version
+                        : null;
+            }
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        // Executes the whole queued batch under the exclusive write
+        // lock, giving real cross-connection atomicity. Aborts with
+        // EXECABORT if a queue-time error dirtied the transaction,
+        // or with a null array if a watched key changed underneath
+        // it — both match real Redis's EXEC semantics.
+        private ValueTask<RespValue> HandleExec(ClientSession session)
+        {
+            if (!session.InTransaction)
+                return Error("ERR EXEC without MULTI");
+
+            session.InTransaction = false;
+
+            if (session.TransactionDirty)
+            {
+                session.TransactionDirty = false;
+                session.QueuedCommands.Clear();
+                session.WatchedKeys.Clear();
+
+                return Error(
+                    "EXECABORT Transaction discarded because of " +
+                    "previous errors.");
+            }
+
+            var queued = session.QueuedCommands.ToArray();
+            session.QueuedCommands.Clear();
+
+            var watched =
+                new Dictionary<string, long?>(session.WatchedKeys);
+
+            session.WatchedKeys.Clear();
+
+            _executionLock.EnterWriteLock();
+
+            try
+            {
+                foreach (var (key, snapshotVersion) in watched)
+                {
+                    var existsNow =
+                        _store.TryGetVersion(key, out var currentVersion);
+
+                    var conflict = snapshotVersion.HasValue
+                        ? !existsNow ||
+                          currentVersion != snapshotVersion.Value
+                        : existsNow;
+
+                    if (conflict)
+                        return ValueTask.FromResult(RespValue.NullArray());
+                }
+
+                var results = new RespValue[queued.Length];
+
+                for (var i = 0; i < queued.Length; i++)
+                {
+                    var commandArgs = queued[i].Items!;
+
+                    var commandName =
+                        GetString(commandArgs[0]).ToUpperInvariant();
+
+                    // Every handler completes synchronously (see
+                    // the comment on _executionLock), so this never
+                    // actually awaits — it's safe to read .Result
+                    // immediately without yielding the thread that
+                    // holds the write lock.
+                    results[i] =
+                        DispatchAsync(commandName, commandArgs).Result;
+                }
+
+                return ValueTask.FromResult(RespValue.Array(results));
+            }
+            finally
+            {
+                _executionLock.ExitWriteLock();
             }
         }
 
@@ -1242,7 +1459,7 @@ namespace recache.Commands
             if (!json.TrySet(path, valueNode, out var byteDelta))
                 return Error("ERR path does not exist");
 
-            _store.AdjustMemory(byteDelta);
+            _store.AdjustMemory(key, byteDelta);
 
             return ValueTask.FromResult(RespValue.Simple("OK"));
         }
@@ -1415,7 +1632,7 @@ namespace recache.Commands
                     "point to an array");
             }
 
-            _store.AdjustMemory(byteDelta);
+            _store.AdjustMemory(key, byteDelta);
 
             return ValueTask.FromResult(RespValue.Integer(newLength));
         }
@@ -1462,7 +1679,7 @@ namespace recache.Commands
                     "point to a number");
             }
 
-            _store.AdjustMemory(byteDelta);
+            _store.AdjustMemory(key, byteDelta);
 
             return ValueTask.FromResult(
                 RespValue.Bulk(
@@ -1624,7 +1841,7 @@ namespace recache.Commands
                 if (hash.Set(field, value, out var delta))
                     added++;
 
-                _store.AdjustMemory(delta);
+                _store.AdjustMemory(key, delta);
             }
 
             return ValueTask.FromResult(RespValue.Integer(added));
@@ -1706,7 +1923,7 @@ namespace recache.Commands
                 if (hash.Remove(GetString(args[i]), out var delta))
                 {
                     removed++;
-                    _store.AdjustMemory(delta);
+                    _store.AdjustMemory(key, delta);
                 }
             }
 
@@ -1858,7 +2075,7 @@ namespace recache.Commands
                     ? list.PushLeft(value)
                     : list.PushRight(value);
 
-                _store.AdjustMemory(delta);
+                _store.AdjustMemory(key, delta);
             }
 
             return ValueTask.FromResult(
@@ -1943,7 +2160,7 @@ namespace recache.Commands
             if (value == null)
                 return ValueTask.FromResult(RespValue.Null());
 
-            _store.AdjustMemory(delta);
+            _store.AdjustMemory(key, delta);
 
             if (list.Count == 0)
                 _store.Remove(key);
@@ -1973,7 +2190,7 @@ namespace recache.Commands
             var value = GetBytes(args[3]);
             var removed = list.Remove(value, count, out var delta);
 
-            _store.AdjustMemory(delta);
+            _store.AdjustMemory(key, delta);
 
             if (list.Count == 0)
                 _store.Remove(key);
@@ -1994,7 +2211,8 @@ namespace recache.Commands
             if (!long.TryParse(GetString(args[2]), out var index))
                 return Error("ERR value is not an integer or out of range");
 
-            var list = _store.TryGetList(GetString(args[1]));
+            var key = GetString(args[1]);
+            var list = _store.TryGetList(key);
 
             if (list == null)
                 return Error("ERR no such key");
@@ -2004,7 +2222,7 @@ namespace recache.Commands
             if (!list.SetAt(index, value, out var delta))
                 return Error("ERR index out of range");
 
-            _store.AdjustMemory(delta);
+            _store.AdjustMemory(key, delta);
 
             return ValueTask.FromResult(RespValue.Simple("OK"));
         }
@@ -2053,7 +2271,7 @@ namespace recache.Commands
                 if (set.Add(GetBytes(args[i]), out var delta))
                 {
                     added++;
-                    _store.AdjustMemory(delta);
+                    _store.AdjustMemory(key, delta);
                 }
             }
 
@@ -2083,7 +2301,7 @@ namespace recache.Commands
                 if (set.Remove(GetBytes(args[i]), out var delta))
                 {
                     removed++;
-                    _store.AdjustMemory(delta);
+                    _store.AdjustMemory(key, delta);
                 }
             }
 
@@ -2188,7 +2406,7 @@ namespace recache.Commands
                 if (zset.Add(member, score, out var delta))
                     added++;
 
-                _store.AdjustMemory(delta);
+                _store.AdjustMemory(key, delta);
             }
 
             return ValueTask.FromResult(RespValue.Integer(added));
@@ -2217,7 +2435,7 @@ namespace recache.Commands
                 if (zset.Remove(GetString(args[i]), out var delta))
                 {
                     removed++;
-                    _store.AdjustMemory(delta);
+                    _store.AdjustMemory(key, delta);
                 }
             }
 

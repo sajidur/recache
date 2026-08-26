@@ -11,7 +11,8 @@ namespace recache.Protocol
         Integer,
         BulkString,
         Null,
-        Array
+        Array,
+        NullArray
     }
 
     public sealed class RespValue
@@ -54,6 +55,13 @@ namespace recache.Protocol
 
         public static RespValue Null()
             => new(RespType.Null);
+
+        // The RESP2 "null array" (*-1\r\n) — distinct from a null
+        // bulk string. Real Redis sends this for EXEC aborted by a
+        // failed WATCH, so a client waiting for an array-or-nil
+        // reply sees the correct wire form.
+        public static RespValue NullArray()
+            => new(RespType.NullArray);
 
         public static RespValue Array(IReadOnlyList<RespValue> items)
             => new(RespType.Array, items: items);

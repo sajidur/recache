@@ -60,7 +60,12 @@ namespace recache.Storage
 
         bool TryGetType(string key, out CacheValueType type);
 
-        void AdjustMemory(long byteDelta);
+        void AdjustMemory(string key, long byteDelta);
+
+        // The key's current write-version, for WATCH. Returns false
+        // if the key doesn't exist (distinct from existing at
+        // version 0 — WATCH needs to tell "gone" from "unchanged").
+        bool TryGetVersion(string key, out long version);
 
         IEnumerable<string> Keys { get; }
 

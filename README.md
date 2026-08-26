@@ -47,6 +47,7 @@ It speaks RESP2 over TCP, so existing Redis clients (`redis-cli`, StackExchange.
 - **Data types**: String, Hash, List, Set, Sorted Set, and JSON (RedisJSON-compatible `JSON.*` commands with JSONPath support)
 - **Expiration**: `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `PERSIST`
 - **Auth**: password-based `AUTH`, matching real Redis's `NOAUTH`/`WRONGPASS` semantics
+- **Transactions**: `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` — `EXEC` runs the whole queued batch under an exclusive lock for real cross-connection atomicity (this server isn't single-threaded like Redis, so that guarantee has to be built rather than assumed), and `WATCH` tracks real per-key versions rather than a coarse "anything changed" flag
 - **RedisInsight-compatible**: `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`, `INFO`, `CONFIG GET`, `CLIENT`, `MODULE LIST`
 - **Logging**: rolling daily log files with automatic retention, alongside console output
 - Runs as a normal console app or as a Windows Service

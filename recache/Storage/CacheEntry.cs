@@ -11,5 +11,10 @@ namespace recache.Storage
         public long LastAccessTimestamp;
 
         public long Frequency;
+
+        // Bumped on every write to this key (value change, TTL
+        // change, or compound-type mutation) — the basis for
+        // WATCH's change detection.
+        public long Version;
     }
 }

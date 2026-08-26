@@ -21,9 +21,30 @@ namespace recache.Storage
         public long MemoryBytes =>
             Interlocked.Read(ref _memoryBytes);
 
-        public void AdjustMemory(long byteDelta)
+        public void AdjustMemory(string key, long byteDelta)
         {
             Interlocked.Add(ref _memoryBytes, byteDelta);
+            BumpVersion(key);
+        }
+
+        public bool TryGetVersion(string key, out long version)
+        {
+            var entry = GetLiveEntry(key);
+
+            if (entry == null)
+            {
+                version = 0;
+                return false;
+            }
+
+            version = Interlocked.Read(ref entry.Version);
+            return true;
+        }
+
+        private void BumpVersion(string key)
+        {
+            if (_entries.TryGetValue(key, out var entry))
+                Interlocked.Increment(ref entry.Version);
         }
 
         // ---- String ----
@@ -48,7 +69,8 @@ namespace recache.Storage
                         LastAccessTimestamp =
                             Stopwatch.GetTimestamp(),
 
-                        Frequency = 1
+                        Frequency = 1,
+                        Version = 1,
                     };
 
                     if (_entries.TryAdd(key, newEntry))
@@ -90,7 +112,8 @@ namespace recache.Storage
                     LastAccessTimestamp =
                         Stopwatch.GetTimestamp(),
 
-                    Frequency = existing.Frequency + 1
+                    Frequency = existing.Frequency + 1,
+                    Version = existing.Version + 1,
                 };
 
                 if (_entries.TryUpdate(key, replacement, existing))
@@ -130,6 +153,8 @@ namespace recache.Storage
             byte[] value,
             TimeSpan? expiration = null)
         {
+            _entries.TryGetValue(key, out var old);
+
             var entry = new CacheEntry
             {
                 Type = CacheValueType.String,
@@ -144,10 +169,11 @@ namespace recache.Storage
                 LastAccessTimestamp =
                     Stopwatch.GetTimestamp(),
 
-                Frequency = 1
+                Frequency = 1,
+                Version = (old?.Version ?? 0) + 1,
             };
 
-            if (_entries.TryGetValue(key, out var old))
+            if (old != null)
             {
                 var oldSize =
                     old.Type == CacheValueType.String
@@ -196,7 +222,8 @@ namespace recache.Storage
                         : null,
 
                 LastAccessTimestamp = Stopwatch.GetTimestamp(),
-                Frequency = 1
+                Frequency = 1,
+                Version = 1,
             };
 
             if (!_entries.TryAdd(key, entry))
@@ -341,7 +368,8 @@ namespace recache.Storage
                             : null,
 
                     LastAccessTimestamp = entry.LastAccessTimestamp,
-                    Frequency = entry.Frequency
+                    Frequency = entry.Frequency,
+                    Version = entry.Version + 1,
                 };
 
                 if (_entries.TryUpdate(key, replacement, entry))
@@ -366,7 +394,8 @@ namespace recache.Storage
                     Payload = entry.Payload,
                     ExpirationTimestamp = null,
                     LastAccessTimestamp = entry.LastAccessTimestamp,
-                    Frequency = entry.Frequency
+                    Frequency = entry.Frequency,
+                    Version = entry.Version + 1,
                 };
 
                 if (_entries.TryUpdate(key, replacement, entry))
