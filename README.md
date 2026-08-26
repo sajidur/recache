@@ -178,6 +178,17 @@ The container needs no config file present — `RecacheOptions` has safe built-i
 
 **Publishing to Docker Hub** happens via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) rather than a local build — GitHub's hosted runners have Docker built in, so this works even without Docker installed locally. It fires on any `v*.*.*` tag push (or manually via the Actions tab) and pushes `sajidur/recache:<version>` and `:latest`. One-time setup: add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token, not your password — generate one at hub.docker.com/settings/security) as repo secrets under Settings → Secrets and variables → Actions.
 
+### Benchmarking
+
+`benchmark/` is a small load-test client (reuses recache's own RESP reader/writer, so results reflect the real protocol path). Run a Release build of recache, then:
+
+```powershell
+cd benchmark
+dotnet run -c Release -- --host 127.0.0.1 --port 6380 --password yourpassword --connections 50 --requests 2000 --pipeline 1
+```
+
+Reports SET/GET/PING throughput and p50/p95/p99 latency. `--pipeline N` batches N requests per round trip before reading replies, for throughput-oriented testing.
+
 ### License
 
 Apache License 2.0 — see [LICENSE](LICENSE).

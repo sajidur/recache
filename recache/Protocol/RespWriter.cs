@@ -1,5 +1,7 @@
-﻿using System;
+using System;
+using System.Buffers;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 
 namespace recache.Protocol
@@ -8,69 +10,81 @@ namespace recache.Protocol
     {
         private readonly Stream _stream;
 
+        // A single connection's writes are always sequential (one
+        // reply is fully written, and awaited, before the next is
+        // built), so it's safe to reuse one scratch buffer per
+        // writer instance. Every reply is serialized here in full
+        // and sent as exactly one stream write — previously a bulk
+        // string alone took three separate writes (length prefix,
+        // payload, CRLF), each its own TCP packet since NoDelay is
+        // set, and an array multiplied that per element.
+        private readonly ArrayBufferWriter<byte> _scratch = new();
+
         public RespWriter(Stream stream)
         {
             _stream = stream;
         }
 
-        public async ValueTask WriteAsync(
+        public ValueTask WriteAsync(
             RespValue value,
             CancellationToken cancellationToken)
+        {
+            _scratch.Clear();
+
+            Serialize(value, _scratch);
+
+            return _stream.WriteAsync(
+                _scratch.WrittenMemory,
+                cancellationToken);
+        }
+
+        private static void Serialize(
+            RespValue value,
+            ArrayBufferWriter<byte> buffer)
         {
             switch (value.Type)
             {
                 case RespType.SimpleString:
 
-                    await WriteStringAsync(
-                        $"+{value.StringValue}\r\n",
-                        cancellationToken);
-
+                    WriteLine(buffer, '+', value.StringValue!);
                     break;
 
                 case RespType.Error:
 
-                    await WriteStringAsync(
-                        $"-{value.StringValue}\r\n",
-                        cancellationToken);
-
+                    WriteLine(buffer, '-', value.StringValue!);
                     break;
 
                 case RespType.Integer:
 
-                    await WriteStringAsync(
-                        $":{value.IntegerValue}\r\n",
-                        cancellationToken);
+                    WriteLine(
+                        buffer,
+                        ':',
+                        value.IntegerValue.ToString(
+                            CultureInfo.InvariantCulture));
 
                     break;
 
                 case RespType.Null:
 
-                    await WriteStringAsync(
-                        "$-1\r\n",
-                        cancellationToken);
-
+                    WriteRaw(buffer, "$-1\r\n");
                     break;
 
                 case RespType.BulkString:
 
-                    await WriteBulkAsync(
-                        value.BinaryValue!,
-                        cancellationToken);
+                    var data = value.BinaryValue!;
+
+                    WriteRaw(buffer, $"${data.Length}\r\n");
+                    buffer.Write(data);
+                    WriteRaw(buffer, "\r\n");
 
                     break;
 
                 case RespType.Array:
 
-                    await WriteStringAsync(
-                        $"*{value.Items!.Count}\r\n",
-                        cancellationToken);
+                    WriteRaw(buffer, $"*{value.Items!.Count}\r\n");
 
                     foreach (var item in value.Items)
-                    {
-                        await WriteAsync(
-                            item,
-                            cancellationToken);
-                    }
+                        Serialize(item, buffer);
 
                     break;
 
@@ -79,30 +93,22 @@ namespace recache.Protocol
             }
         }
 
-        private async ValueTask WriteBulkAsync(
-            byte[] data,
-            CancellationToken cancellationToken)
+        private static void WriteLine(
+            ArrayBufferWriter<byte> buffer,
+            char prefix,
+            string text)
         {
-            await WriteStringAsync(
-                $"${data.Length}\r\n",
-                cancellationToken);
-
-            await _stream.WriteAsync(
-                data,
-                cancellationToken);
-
-            await _stream.WriteAsync(
-                "\r\n"u8.ToArray(),
-                cancellationToken);
+            WriteRaw(buffer, $"{prefix}{text}\r\n");
         }
 
-        private ValueTask WriteStringAsync(
-            string value,
-            CancellationToken cancellationToken)
+        private static void WriteRaw(
+            ArrayBufferWriter<byte> buffer,
+            string text)
         {
-            return _stream.WriteAsync(
-                Encoding.UTF8.GetBytes(value),
-                cancellationToken);
+            var byteCount = Encoding.UTF8.GetByteCount(text);
+            var span = buffer.GetSpan(byteCount);
+            var written = Encoding.UTF8.GetBytes(text, span);
+            buffer.Advance(written);
         }
 
         public ValueTask SimpleStringAsync(

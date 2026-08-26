@@ -10,6 +10,15 @@ namespace recache.Protocol
         private readonly Stream _stream;
         private readonly int _maxRequestBytes;
 
+        // Every read (byte-at-a-time parsing and bulk-string bodies
+        // alike) goes through this buffer instead of the stream
+        // directly. Without it, a single ~35-byte SET command meant
+        // 30+ individual async socket reads — one per byte — which
+        // dominates latency far more than actual command execution.
+        private readonly byte[] _buffer = new byte[8192];
+        private int _bufferStart;
+        private int _bufferEnd;
+
         public RespReader(
             Stream stream,
             int maxRequestBytes)
@@ -152,15 +161,13 @@ namespace recache.Protocol
         private async ValueTask<int> ReadByteAsync(
             CancellationToken cancellationToken)
         {
-            var buffer = new byte[1];
+            if (_bufferStart == _bufferEnd &&
+                !await FillBufferAsync(cancellationToken))
+            {
+                return -1;
+            }
 
-            var count = await _stream.ReadAsync(
-                buffer,
-                cancellationToken);
-
-            return count == 0
-                ? -1
-                : buffer[0];
+            return _buffer[_bufferStart++];
         }
 
         private async ValueTask ReadExactlyAsync(
@@ -171,15 +178,37 @@ namespace recache.Protocol
 
             while (position < buffer.Length)
             {
-                var read = await _stream.ReadAsync(
-                    buffer[position..],
-                    cancellationToken);
-
-                if (read == 0)
+                if (_bufferStart == _bufferEnd &&
+                    !await FillBufferAsync(cancellationToken))
+                {
                     throw new EndOfStreamException();
+                }
 
-                position += read;
+                var available = _bufferEnd - _bufferStart;
+                var toCopy = Math.Min(
+                    available,
+                    buffer.Length - position);
+
+                _buffer.AsSpan(_bufferStart, toCopy).CopyTo(
+                    buffer.Span.Slice(position, toCopy));
+
+                _bufferStart += toCopy;
+                position += toCopy;
             }
+        }
+
+        // Refills the internal buffer from the stream. Returns
+        // false at end of stream.
+        private async ValueTask<bool> FillBufferAsync(
+            CancellationToken cancellationToken)
+        {
+            _bufferEnd = await _stream.ReadAsync(
+                _buffer,
+                cancellationToken);
+
+            _bufferStart = 0;
+
+            return _bufferEnd != 0;
         }
 
         private async ValueTask ExpectCrlfAsync(
