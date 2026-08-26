@@ -3,6 +3,7 @@
 #define MyAppPublisher "Recache"
 #define MyAppExeName "recache.exe"
 #define MyServiceName "Recache"
+#define MyServiceDisplayName "Recache Cache Service"
 #define PublishDir "..\recache\publish"
 
 [Setup]
@@ -23,11 +24,21 @@ WizardStyle=modern
 
 [Files]
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "service-install.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "service-uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
+; Service registration is done with direct sc.exe calls rather than
+; shelling out to "powershell.exe -ExecutionPolicy Bypass -File ..."
+; — that exact invocation pattern (interpreter + execution-policy
+; bypass + script file, spawned from an installer) is also what
+; malware droppers commonly do, and is a much more likely trigger
+; for AV/Defender heuristics than the lack of a trusted signature.
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\service-install.ps1"""; Flags: runhidden waituntilterminated; StatusMsg: "Installing and starting the Recache service..."
+Filename: "{sys}\sc.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden; StatusMsg: "Stopping any existing Recache service..."
+Filename: "{sys}\sc.exe"; Parameters: "delete {#MyServiceName}"; Flags: runhidden; StatusMsg: "Removing any existing Recache service..."
+Filename: "{sys}\sc.exe"; Parameters: "create {#MyServiceName} binPath= ""{app}\{#MyAppExeName}"" start= auto DisplayName= ""{#MyServiceDisplayName}"""; Flags: runhidden; StatusMsg: "Registering the Recache service..."
+Filename: "{sys}\sc.exe"; Parameters: "description {#MyServiceName} ""In-memory Redis-compatible cache server (recache).""" ; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "failure {#MyServiceName} reset= 86400 actions= restart/5000/restart/5000/restart/5000"; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "start {#MyServiceName}"; Flags: runhidden; StatusMsg: "Starting the Recache service..."
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\service-uninstall.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "StopRecacheService"
+Filename: "{sys}\sc.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden; RunOnceId: "StopRecacheService"
+Filename: "{sys}\sc.exe"; Parameters: "delete {#MyServiceName}"; Flags: runhidden; RunOnceId: "DeleteRecacheService"

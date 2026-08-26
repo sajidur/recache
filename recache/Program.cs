@@ -53,7 +53,7 @@ builder.Services.AddSingleton<
 builder.Services.AddSingleton<
     CommandDispatcher>();
 
-builder.Services.AddSingleton<
+builder.Services.AddHostedService<
     RecacheServer>();
 
 // Runs under the Windows Service Control Manager when launched that
@@ -86,16 +86,8 @@ if (startupOptions.RequireAuth &&
         "before exposing this server.");
 }
 
-var server =
-    host.Services.GetRequiredService<
-        RecacheServer>();
-
-var lifetime =
-    host.Services.GetRequiredService<
-        IHostApplicationLifetime>();
-
-lifetime.ApplicationStopping.Register(
-    server.Stop);
-
-await server.StartAsync(
-    lifetime.ApplicationStopping);
+// host.RunAsync() drives the IHostedService lifecycle and fires
+// ApplicationStarted once RecacheServer.StartAsync returns — that's
+// the signal WindowsServiceLifetime needs to report "running" back
+// to the Service Control Manager.
+await host.RunAsync();

@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using recache.Commands;
 using recache.Configuration;
 using recache.Storage;
@@ -9,7 +10,15 @@ using System.Net.Sockets;
 
 namespace recache.Server
 {
-    public sealed class RecacheServer
+    // A BackgroundService (real IHostedService) rather than a plain
+    // class driven manually — the Generic Host only fires
+    // ApplicationStarted once every registered IHostedService's
+    // StartAsync returns, and WindowsServiceLifetime only reports
+    // "running" to the Service Control Manager once that happens.
+    // Bypassing IHostedService here previously left the SCM waiting
+    // until it timed out ("service did not respond in a timely
+    // fashion"), even though the server itself was working fine.
+    public sealed class RecacheServer : BackgroundService
     {
             private readonly RecacheOptions _options;
             private readonly CommandDispatcher _dispatcher;
@@ -29,8 +38,8 @@ namespace recache.Server
                 _logger = logger;
             }
 
-            public async Task StartAsync(
-                CancellationToken cancellationToken)
+            protected override async Task ExecuteAsync(
+                CancellationToken stoppingToken)
             {
                 var bindAllInterfaces = _options.Host == "0.0.0.0";
 
@@ -56,38 +65,45 @@ namespace recache.Server
                     _options.Host,
                     _options.Port);
 
-                while (!cancellationToken.IsCancellationRequested)
+                try
                 {
-                    TcpClient client;
-
-                    try
+                    while (!stoppingToken.IsCancellationRequested)
                     {
-                        client =
-                            await _listener.AcceptTcpClientAsync(
-                                cancellationToken);
+                        TcpClient client;
+
+                        try
+                        {
+                            client =
+                                await _listener.AcceptTcpClientAsync(
+                                    stoppingToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+
+                        client.NoDelay = true;
+
+                        if (Interlocked.Increment(
+                                ref _connections)
+                            > _options.MaxConnections)
+                        {
+                            Interlocked.Decrement(
+                                ref _connections);
+
+                            client.Dispose();
+
+                            continue;
+                        }
+
+                        _ = HandleClientAsync(
+                            client,
+                            stoppingToken);
                     }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-
-                    client.NoDelay = true;
-
-                    if (Interlocked.Increment(
-                            ref _connections)
-                        > _options.MaxConnections)
-                    {
-                        Interlocked.Decrement(
-                            ref _connections);
-
-                        client.Dispose();
-
-                        continue;
-                    }
-
-                    _ = HandleClientAsync(
-                        client,
-                        cancellationToken);
+                }
+                finally
+                {
+                    _listener.Stop();
                 }
             }
 
@@ -122,11 +138,6 @@ namespace recache.Server
 
                     client.Dispose();
                 }
-            }
-
-            public void Stop()
-            {
-                _listener?.Stop();
             }
         }
     }
