@@ -24,6 +24,11 @@ It speaks RESP2 over TCP, so existing Redis clients (`redis-cli`, StackExchange.
                     │       ▼                         │
                     │  Command Dispatcher             │
                     │       │                         │
+                    │       ▼                         │
+                    │  Cluster Slot Gate (optional)   │
+                    │  key → CRC16 slot → owner?       │
+                    │  MOVED / ASK / CROSSSLOT         │
+                    │       │                         │
                     │  ┌────┴────────────────────┐   │
                     │  │                         │   │
                     │  ▼                         ▼   │
@@ -196,9 +201,84 @@ Reports SET/GET/PING throughput and p50/p95/p99 latency. `--pipeline N` batches 
 
 recache can shard keys across multiple statically-configured instances using the same 16384-slot model as real Redis Cluster — `CLUSTER KEYSLOT` returns the exact same slot number real Redis would for any given key (CRC16/XMODEM, with `{hashtag}` support for co-locating related keys), and `redis-cli -c` / cluster-aware client libraries get real `MOVED`/`ASK` redirection.
 
-**What's implemented**: `CLUSTER INFO/MYID/NODES/SLOTS/SHARDS/KEYSLOT/COUNTKEYSINSLOT/GETKEYSINSLOT/ADDSLOTS(RANGE)/DELSLOTS(RANGE)/SETSLOT/MEET/FORGET/REPLICATE/RESET/SET-CONFIG-EPOCH/BUMPEPOCH/SAVECONFIG`, plus `ASKING` and full `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN` enforcement on every key-bearing command. Node identity and slot ownership persist to a `nodes.conf`-style file across restarts.
+Off by default (`Recache:ClusterEnabled: false` / `Recache__ClusterEnabled=false`). A standalone node's behavior is completely unaffected — the slot gate described below only exists in the dispatch path when cluster mode is on.
 
-**What's not implemented yet**: there's no gossip/cluster-bus, so topology doesn't propagate automatically — `CLUSTER MEET` works by connecting to the peer over ordinary RESP and pulling its `CLUSTER NODES` view once (a real, working bootstrap, just not a live background sync). There's also no replication and no automatic failover; `CLUSTER REPLICATE`/`FAILOVER` exist mostly as bookkeeping. In short: manual, static multi-node sharding works end-to-end today; self-healing cluster behavior is future work.
+#### Architecture
+
+Each recache process is still just one ordinary node — "cluster mode" doesn't change how a node stores data, only what happens *before* a command reaches storage:
+
+1. **`ClusterKeyMap`** (`Clustering/ClusterKeyMap.cs`) — a static table of which argument positions are keys for every command (`GET key`, `MSET`-style multi-key spans, etc.), the same `first/last/step` convention Redis's own `COMMAND INFO` uses.
+2. **`HashSlot.Compute(key)`** (`Clustering/HashSlot.cs`) — CRC16/XMODEM over the key bytes (or just the `{...}` hashtag substring, if present), masked to 0–16383.
+3. **`ClusterState`** (`Clustering/ClusterState.cs`) — this node's view of the topology: a 16384-entry slot→node-id table, the set of known nodes, and this node's own id/epoch. Guarded by its own lock, independent of the `ReaderWriterLockSlim` that protects key-space reads/writes — a `CLUSTER ADDSLOTS` doesn't contend with concurrent `GET`s.
+4. `CommandDispatcher.ExecuteAsync` runs the gate right after auth, before a command can queue into `MULTI` or reach a handler: compute the slot(s) for the command's keys, then:
+   - keys span more than one slot → `-CROSSSLOT`
+   - slot has no owner yet → `-CLUSTERDOWN`
+   - a different node owns it → `-MOVED <slot> <host>:<port>` (or `-ASK` if the owner has marked the slot `MIGRATING` away and the key isn't present locally — see below)
+   - this node owns it → the command runs exactly as it would standalone
+
+There is no coordinator process and no consensus protocol. Each node's `ClusterState` is independently persisted and only ever changes because of a local `CLUSTER` command or a one-shot `CLUSTER MEET` import (next section) — see [Roadmap](#roadmap) for what a real gossip protocol would add.
+
+#### Slot migration state machine
+
+A slot is always in one of three states on the node that currently or formerly owned it:
+
+| State | Set by | Effect |
+|---|---|---|
+| **STABLE** | default / `CLUSTER SETSLOT <slot> STABLE` | normal — only the owner serves it |
+| **MIGRATING** | `CLUSTER SETSLOT <slot> MIGRATING <target-id>` (owner only) | owner still serves keys that exist locally; a request for a key that *doesn't* exist locally gets `-ASK <slot> <target-host>:<target-port>` instead of just creating it, so the client retries against the node it's moving to |
+| **IMPORTING** | `CLUSTER SETSLOT <slot> IMPORTING <source-id>` (non-owner only) | the target node will accept commands for this slot, but only when the client sent `ASKING` immediately before — a bare request without `ASKING` still gets `-MOVED` back to the real owner |
+
+`CLUSTER SETSLOT <slot> NODE <id>` finalizes a migration by reassigning ownership outright (clearing any in-progress state). Note that **recache doesn't move the key data itself** — there's no `MIGRATE` command yet, so moving a slot's keys is a manual `DUMP`/copy/`DEL` exercise (or just letting them land on the new owner naturally as new writes arrive) before calling `SETSLOT NODE` to finalize. `MIGRATING`/`IMPORTING` state is in-memory only and does not survive a restart (matching real Redis — a restart always resumes as `STABLE`).
+
+#### `CLUSTER` command reference
+
+| Command | What it does |
+|---|---|
+| `CLUSTER INFO` | Bulk-string status block (`cluster_enabled`, `cluster_state`, slot/epoch counters) |
+| `CLUSTER MYID` | This node's 40-hex-char id |
+| `CLUSTER NODES` | Full topology as newline-separated lines (see file format below) |
+| `CLUSTER SLOTS` / `CLUSTER SHARDS` | Slot ranges with owning node address, in the nested-array shapes cluster-aware clients expect |
+| `CLUSTER KEYSLOT <key>` | The slot a key hashes to |
+| `CLUSTER COUNTKEYSINSLOT <slot>` / `GETKEYSINSLOT <slot> <count>` | Scans local keys for ones in a given slot (O(keys) — fine for a dev tool, not for huge keyspaces) |
+| `CLUSTER ADDSLOTS <slot> [slot ...]` / `ADDSLOTSRANGE <start> <end> [...]` | Assigns slots to this node; errors if any requested slot already has an owner |
+| `CLUSTER DELSLOTS` / `DELSLOTSRANGE` | Unassigns slots (also clears any in-flight migration state on them) |
+| `CLUSTER SETSLOT <slot> MIGRATING\|IMPORTING\|STABLE\|NODE ...` | Drives the migration state machine above |
+| `CLUSTER MEET <ip> <port>` | See below — pulls the peer's topology over ordinary RESP |
+| `CLUSTER FORGET <id>` | Removes a node and frees any slots it owned |
+| `CLUSTER REPLICATE <id>` | Marks this node as a replica of `<id>` (bookkeeping only today — see Roadmap) |
+| `CLUSTER RESET [HARD]` | Clears slot ownership and known peers; `HARD` also discards this node's own id/epoch |
+| `CLUSTER SET-CONFIG-EPOCH <n>` / `BUMPEPOCH` | Manual epoch control |
+| `CLUSTER SAVECONFIG` | No-op — `nodes.conf` is written on every topology mutation already |
+| `ASKING` | One-shot per-connection flag consumed by the next command, per the `IMPORTING` row above |
+
+#### `CLUSTER MEET` and topology bootstrap
+
+Real Redis Cluster nodes discover each other and keep their topology in sync via a binary gossip protocol over a second "cluster bus" port. recache doesn't have that yet, so `CLUSTER MEET <ip> <port>` does the next best thing: it opens an ordinary RESP connection to the peer (the same protocol any client uses), runs `CLUSTER NODES` against it, and merges the result into this node's own `ClusterState` — including any nodes *that peer* already knew about, so a full mesh only needs one `MEET` per pair, not per node. It's a real, working one-shot import, not a stub — but it's exactly that: one-shot. If topology changes on one node afterward (a new `ADDSLOTS`, a new peer), other nodes won't find out until someone runs `CLUSTER MEET` again.
+
+#### `nodes.conf` file format
+
+Each node persists its view of the cluster to `Recache:ClusterConfigFile` (default `nodes.conf`, resolved relative to the content root) on every topology change, and reloads it on startup so node identity and slot ownership survive restarts. One line per known node:
+
+```
+<node-id> <ip>:<port>@<cluster-bus-port> <flags> <master-id-or-"-"> <ping-sent> <pong-recv> <config-epoch> <link-state> [<slot-or-range> ...]
+```
+
+e.g.
+
+```
+a76782250e645b8d3162187a0339cd661a97d56e 127.0.0.1:6380@16380 myself,master - 0 0 0 connected 0-8191
+2902dec4d2a5b4b0a8136cfcd3d8910bb3c5712f 127.0.0.1:6381@16381 master - 0 0 0 connected 8192-16383
+```
+
+This mirrors real Redis's `nodes.conf` shape closely enough to be readable by anyone who's seen the real thing, but it's recache's own format (no cluster-bus handshake data, no vector clocks) — it's not interchangeable with an actual Redis node's `nodes.conf`. `ping-sent`/`pong-recv`/`link-state` are placeholders today since there's no bus to actually ping over yet.
+
+#### Roadmap
+
+What's here now is real, working **static** multi-node sharding: manual slot assignment, correct `MOVED`/`ASK`/`CROSSSLOT` redirection, and a one-shot topology bootstrap via `CLUSTER MEET`. What's deliberately not built yet:
+
+- **Gossip / cluster bus** — a second listener per node exchanging periodic PING/PONG topology + health gossip, so `ADDSLOTS`/`MEET`/node failures propagate automatically instead of needing another manual `CLUSTER MEET`.
+- **Replication** — `CLUSTER REPLICATE` currently only flips a local role flag; there's no actual command stream from master to replica yet.
+- **Automatic failover** — no failure detection (`PFAIL`/`FAIL`), no quorum voting, no automatic replica promotion. `CLUSTER FAILOVER` isn't implemented.
 
 **Bring-up** (two nodes on localhost):
 
