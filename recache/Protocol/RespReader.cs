@@ -61,7 +61,7 @@ namespace recache.Protocol
                 cancellationToken);
 
             if (count < 0)
-                return RespValue.Null();
+                return RespValue.NullArray();
 
             if (count > 1024)
                 throw new RespProtocolException(
