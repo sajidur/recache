@@ -7,6 +7,11 @@ namespace recache.Security
     {
         public bool IsAuthenticated { get; set; }
 
+        // Set by ASKING, consumed by the next command's slot check —
+        // real Redis's one-shot opt-in to query a slot this node is
+        // IMPORTING but doesn't yet own.
+        public bool Asking { get; set; }
+
         public bool InTransaction { get; set; }
 
         // Set when a command fails to queue (e.g. unknown command

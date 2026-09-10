@@ -16,3 +16,11 @@ Recache:
   EnableFileLogging: true
   LogDirectory: "logs"
   LogRetentionDays: 7
+
+  # Hash-slot cluster mode: CLUSTER commands, MOVED/ASK redirection,
+  # CROSSSLOT/CLUSTERDOWN enforcement. Off by default. See the
+  # "Cluster mode" section in README.md for a bring-up walkthrough.
+  ClusterEnabled: false
+  ClusterConfigFile: "nodes.conf"
+  # ClusterAnnounceIp: "192.168.1.10"   # defaults to Host if unset
+  # ClusterAnnouncePort: 6380           # defaults to Port if unset

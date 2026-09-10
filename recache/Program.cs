@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using recache.Clustering;
 using recache.Commands;
 using recache.Configuration;
 using recache.Security;
@@ -104,6 +105,15 @@ builder.Services.AddSingleton<ICacheStore,
 
 builder.Services.AddSingleton<
     AuthenticationManager>();
+
+builder.Services.AddSingleton<ClusterState>(sp =>
+{
+    var options = sp.GetRequiredService<RecacheOptions>();
+
+    return options.ClusterEnabled
+        ? new ClusterState(options, builder.Environment.ContentRootPath)
+        : null!;
+});
 
 builder.Services.AddSingleton<
     CommandDispatcher>();

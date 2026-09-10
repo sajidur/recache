@@ -1,10 +1,12 @@
-﻿using recache.Configuration;
+﻿using recache.Clustering;
+using recache.Configuration;
 using recache.Protocol;
 using recache.Security;
 using recache.Storage;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -17,6 +19,7 @@ namespace recache.Commands
         private readonly ICacheStore _store;
         private readonly AuthenticationManager _auth;
         private readonly RecacheOptions _options;
+        private readonly ClusterState? _cluster;
         private readonly string _runId;
         private readonly DateTimeOffset _startedAt;
 
@@ -52,17 +55,19 @@ namespace recache.Commands
                 "JSON.FORGET", "JSON.TYPE", "JSON.OBJKEYS",
                 "JSON.STRLEN", "JSON.ARRLEN", "JSON.OBJLEN",
                 "JSON.ARRAPPEND", "JSON.NUMINCRBY", "AUTH", "MULTI",
-                "EXEC", "DISCARD", "WATCH", "UNWATCH",
+                "EXEC", "DISCARD", "WATCH", "UNWATCH", "CLUSTER",
             };
 
         public CommandDispatcher(
             ICacheStore store,
             AuthenticationManager auth,
-            RecacheOptions options)
+            RecacheOptions options,
+            ClusterState? cluster = null)
         {
             _store = store;
             _auth = auth;
             _options = options;
+            _cluster = cluster;
             _runId = Guid.NewGuid().ToString("N");
             _startedAt = DateTimeOffset.UtcNow;
         }
@@ -119,6 +124,18 @@ namespace recache.Commands
                 case "UNWATCH":
                     session.WatchedKeys.Clear();
                     return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "ASKING":
+                    session.Asking = true;
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+            }
+
+            if (_cluster is not null)
+            {
+                var redirect = CheckClusterRedirect(command, args, session);
+
+                if (redirect is not null)
+                    return ValueTask.FromResult(redirect);
             }
 
             if (session.InTransaction)
@@ -193,6 +210,8 @@ namespace recache.Commands
                     "CONFIG" => Config(args),
 
                     "COMMAND" => Command(args),
+
+                    "CLUSTER" => Cluster(args),
 
                     "SELECT" => Select(args),
 
@@ -2591,7 +2610,10 @@ namespace recache.Commands
 
             sb.Append("# Server\r\n");
             sb.Append("redis_version:7.4.0\r\n");
-            sb.Append("redis_mode:standalone\r\n");
+
+            sb.Append(
+                $"redis_mode:{(_cluster is null ? "standalone" : "cluster")}\r\n");
+
             sb.Append($"os:{Environment.OSVersion}\r\n");
             sb.Append("arch_bits:64\r\n");
             sb.Append($"process_id:{Environment.ProcessId}\r\n");
@@ -2618,8 +2640,17 @@ namespace recache.Commands
             sb.Append("total_commands_processed:0\r\n");
 
             sb.Append("\r\n# Replication\r\n");
-            sb.Append("role:master\r\n");
+
+            sb.Append(
+                $"role:{(_cluster is { Self.Role: ClusterNodeRole.Replica } ? "slave" : "master")}\r\n");
+
             sb.Append("connected_slaves:0\r\n");
+
+            if (_cluster is not null)
+            {
+                sb.Append("\r\n# Cluster\r\n");
+                sb.Append("cluster_enabled:1\r\n");
+            }
 
             sb.Append("\r\n# CPU\r\n");
             sb.Append("used_cpu_sys:0.0\r\n");
@@ -2747,6 +2778,595 @@ namespace recache.Commands
 
             return Error(
                 $"ERR Unknown CONFIG subcommand '{sub}'");
+        }
+
+        // Computes the slot for a key-bearing command's key(s) and
+        // decides whether this node is allowed to serve it. Returns
+        // null to let the command proceed normally.
+        private RespValue? CheckClusterRedirect(
+            string command,
+            IReadOnlyList<RespValue> args,
+            ClientSession session)
+        {
+            var keyIndexes = ClusterKeyMap.GetKeyIndexes(command, args.Count);
+
+            if (keyIndexes.Count == 0)
+                return null;
+
+            var asking = session.Asking;
+            session.Asking = false;
+
+            int? slot = null;
+
+            foreach (var index in keyIndexes)
+            {
+                var keySlot = HashSlot.Compute(GetString(args[index]));
+
+                if (slot is null)
+                    slot = keySlot;
+                else if (slot != keySlot)
+                {
+                    return RespValue.Error(
+                        "CROSSSLOT Keys in request don't hash to " +
+                        "the same slot");
+                }
+            }
+
+            var slotValue = slot!.Value;
+            var owner = _cluster!.GetOwner(slotValue);
+
+            if (owner is null)
+                return RespValue.Error("CLUSTERDOWN Hash slot not served");
+
+            if (owner.Id == _cluster.MyId)
+            {
+                var migration = _cluster.GetMigration(slotValue);
+
+                if (migration is { State: SlotMigrationState.Migrating } m &&
+                    keyIndexes.Count == 1 &&
+                    !_store.Exists(GetString(args[keyIndexes[0]])))
+                {
+                    var target = _cluster.GetNode(m.PeerNodeId);
+
+                    if (target is not null)
+                    {
+                        return RespValue.Error(
+                            $"ASK {slotValue} {target.Host}:{target.Port}");
+                    }
+                }
+
+                return null;
+            }
+
+            var importing = _cluster.GetMigration(slotValue);
+
+            if (asking &&
+                importing is { State: SlotMigrationState.Importing })
+            {
+                return null;
+            }
+
+            return RespValue.Error(
+                $"MOVED {slotValue} {owner.Host}:{owner.Port}");
+        }
+
+        private ValueTask<RespValue> Cluster(
+            IReadOnlyList<RespValue> args)
+        {
+            if (_cluster is null)
+            {
+                return Error(
+                    "ERR This instance has cluster support disabled");
+            }
+
+            if (args.Count < 2)
+            {
+                return Error(
+                    "ERR wrong number of arguments " +
+                    "for 'cluster' command");
+            }
+
+            var sub = GetString(args[1]).ToUpperInvariant();
+
+            switch (sub)
+            {
+                case "MYID":
+                    return ValueTask.FromResult(
+                        RespValue.Bulk(
+                            Encoding.UTF8.GetBytes(_cluster.MyId)));
+
+                case "INFO":
+                    return ValueTask.FromResult(ClusterInfo());
+
+                case "NODES":
+                    return ValueTask.FromResult(
+                        RespValue.Bulk(
+                            Encoding.UTF8.GetBytes(
+                                _cluster.ToNodesText())));
+
+                case "SLOTS":
+                    return ValueTask.FromResult(ClusterSlotsReply());
+
+                case "SHARDS":
+                    return ValueTask.FromResult(ClusterShardsReply());
+
+                case "KEYSLOT":
+                    if (args.Count != 3)
+                    {
+                        return Error(
+                            "ERR wrong number of arguments " +
+                            "for 'cluster|keyslot' command");
+                    }
+
+                    return ValueTask.FromResult(
+                        RespValue.Integer(
+                            HashSlot.Compute(GetString(args[2]))));
+
+                case "COUNTKEYSINSLOT":
+                    return ClusterCountKeysInSlot(args);
+
+                case "GETKEYSINSLOT":
+                    return ClusterGetKeysInSlot(args);
+
+                case "ADDSLOTS":
+                    return ClusterAddSlots(args, ranges: false);
+
+                case "ADDSLOTSRANGE":
+                    return ClusterAddSlots(args, ranges: true);
+
+                case "DELSLOTS":
+                    return ClusterDelSlots(args, ranges: false);
+
+                case "DELSLOTSRANGE":
+                    return ClusterDelSlots(args, ranges: true);
+
+                case "SETSLOT":
+                    return ClusterSetSlot(args);
+
+                case "MEET":
+                    return ClusterMeet(args);
+
+                case "FORGET":
+                    if (args.Count != 3)
+                    {
+                        return Error(
+                            "ERR wrong number of arguments " +
+                            "for 'cluster|forget' command");
+                    }
+
+                    var forgetId = GetString(args[2]);
+
+                    return ValueTask.FromResult(
+                        _cluster.Forget(forgetId)
+                            ? RespValue.Simple("OK")
+                            : RespValue.Error(
+                                $"ERR Unknown node {forgetId}"));
+
+                case "REPLICATE":
+                    return ClusterReplicate(args);
+
+                case "RESET":
+                    var hard = args.Count >= 3 &&
+                        string.Equals(
+                            GetString(args[2]),
+                            "HARD",
+                            StringComparison.OrdinalIgnoreCase);
+
+                    _cluster.Reset(hard);
+
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "SET-CONFIG-EPOCH":
+                    if (args.Count != 3 ||
+                        !long.TryParse(GetString(args[2]), out var epoch))
+                    {
+                        return Error(
+                            "ERR Invalid config epoch specified: " +
+                            "must be a non-negative integer");
+                    }
+
+                    _cluster.SetConfigEpoch(epoch);
+
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "BUMPEPOCH":
+                    var newEpoch = _cluster.BumpEpoch();
+
+                    return ValueTask.FromResult(
+                        RespValue.Simple($"BUMPED {newEpoch}"));
+
+                case "SAVECONFIG":
+                    // ClusterState persists to ClusterConfigFile on
+                    // every mutation already, so there's nothing
+                    // extra to flush.
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                default:
+                    return Error(
+                        $"ERR Unknown CLUSTER subcommand '{sub}'");
+            }
+        }
+
+        private ValueTask<RespValue> ClusterCountKeysInSlot(
+            IReadOnlyList<RespValue> args)
+        {
+            if (args.Count != 3 ||
+                !int.TryParse(GetString(args[2]), out var slot) ||
+                slot < 0 ||
+                slot >= HashSlot.SlotCount)
+            {
+                return Error("ERR Invalid slot");
+            }
+
+            long count = 0;
+
+            foreach (var key in _store.Keys)
+            {
+                if (HashSlot.Compute(key) == slot)
+                    count++;
+            }
+
+            return ValueTask.FromResult(RespValue.Integer(count));
+        }
+
+        private ValueTask<RespValue> ClusterGetKeysInSlot(
+            IReadOnlyList<RespValue> args)
+        {
+            if (args.Count != 4 ||
+                !int.TryParse(GetString(args[2]), out var slot) ||
+                slot < 0 ||
+                slot >= HashSlot.SlotCount ||
+                !int.TryParse(GetString(args[3]), out var count) ||
+                count < 0)
+            {
+                return Error("ERR Invalid slot or count");
+            }
+
+            var result = new List<RespValue>();
+
+            foreach (var key in _store.Keys)
+            {
+                if (result.Count >= count)
+                    break;
+
+                if (HashSlot.Compute(key) == slot)
+                {
+                    result.Add(
+                        RespValue.Bulk(Encoding.UTF8.GetBytes(key)));
+                }
+            }
+
+            return ValueTask.FromResult(RespValue.Array(result));
+        }
+
+        private ValueTask<RespValue> ClusterAddSlots(
+            IReadOnlyList<RespValue> args,
+            bool ranges)
+        {
+            if (!TryParseSlotArgs(args, ranges, out var slots, out var err))
+                return Error(err!);
+
+            var busy = _cluster!.AddSlots(slots);
+
+            if (busy.Count > 0)
+            {
+                return Error(
+                    $"ERR Slot {busy[0]} is already busy");
+            }
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private ValueTask<RespValue> ClusterDelSlots(
+            IReadOnlyList<RespValue> args,
+            bool ranges)
+        {
+            if (!TryParseSlotArgs(args, ranges, out var slots, out var err))
+                return Error(err!);
+
+            var free = _cluster!.RemoveSlots(slots);
+
+            if (free.Count > 0)
+            {
+                return Error(
+                    $"ERR Slot {free[0]} is already unassigned");
+            }
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private static bool TryParseSlotArgs(
+            IReadOnlyList<RespValue> args,
+            bool ranges,
+            out List<int> slots,
+            out string? error)
+        {
+            slots = new List<int>();
+            error = null;
+
+            if (args.Count < 3 || (ranges && args.Count % 2 != 0))
+            {
+                error =
+                    "ERR wrong number of arguments for 'cluster' command";
+
+                return false;
+            }
+
+            if (ranges)
+            {
+                for (var i = 2; i < args.Count; i += 2)
+                {
+                    if (!TryParseSlot(GetString(args[i]), out var start) ||
+                        !TryParseSlot(
+                            GetString(args[i + 1]),
+                            out var end) ||
+                        start > end)
+                    {
+                        error = "ERR Invalid slot range";
+                        return false;
+                    }
+
+                    for (var slot = start; slot <= end; slot++)
+                        slots.Add(slot);
+                }
+            }
+            else
+            {
+                for (var i = 2; i < args.Count; i++)
+                {
+                    if (!TryParseSlot(GetString(args[i]), out var slot))
+                    {
+                        error = "ERR Invalid slot";
+                        return false;
+                    }
+
+                    slots.Add(slot);
+                }
+            }
+
+            return true;
+        }
+
+        private static bool TryParseSlot(string text, out int slot)
+        {
+            return int.TryParse(text, out slot) &&
+                slot >= 0 &&
+                slot < HashSlot.SlotCount;
+        }
+
+        private ValueTask<RespValue> ClusterSetSlot(
+            IReadOnlyList<RespValue> args)
+        {
+            if (args.Count < 4 ||
+                !TryParseSlot(GetString(args[2]), out var slot))
+            {
+                return Error(
+                    "ERR wrong number of arguments " +
+                    "for 'cluster|setslot' command");
+            }
+
+            var mode = GetString(args[3]).ToUpperInvariant();
+
+            switch (mode)
+            {
+                case "MIGRATING":
+                    if (args.Count != 5)
+                        return Error("ERR wrong number of arguments");
+
+                    var migrateTarget = GetString(args[4]);
+
+                    if (_cluster!.GetNode(migrateTarget) is null)
+                        return Error($"ERR Unknown node {migrateTarget}");
+
+                    if (_cluster.GetOwner(slot)?.Id != _cluster.MyId)
+                    {
+                        return Error(
+                            $"ERR I'm not the owner of hash slot {slot}");
+                    }
+
+                    _cluster.SetMigrating(slot, migrateTarget);
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "IMPORTING":
+                    if (args.Count != 5)
+                        return Error("ERR wrong number of arguments");
+
+                    var importSource = GetString(args[4]);
+
+                    if (_cluster!.GetNode(importSource) is null)
+                        return Error($"ERR Unknown node {importSource}");
+
+                    if (_cluster.GetOwner(slot)?.Id == _cluster.MyId)
+                    {
+                        return Error(
+                            $"ERR I'm already the owner of hash " +
+                            $"slot {slot}");
+                    }
+
+                    _cluster.SetImporting(slot, importSource);
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "STABLE":
+                    _cluster!.ClearMigration(slot);
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "NODE":
+                    if (args.Count != 5)
+                        return Error("ERR wrong number of arguments");
+
+                    var owner = GetString(args[4]);
+
+                    if (_cluster!.GetNode(owner) is null)
+                        return Error($"ERR Unknown node {owner}");
+
+                    _cluster.AssignSlot(slot, owner);
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                default:
+                    return Error(
+                        $"ERR Unknown CLUSTER SETSLOT mode '{mode}'");
+            }
+        }
+
+        private ValueTask<RespValue> ClusterMeet(
+            IReadOnlyList<RespValue> args)
+        {
+            if (args.Count < 4 ||
+                !int.TryParse(GetString(args[3]), out var port))
+            {
+                return Error(
+                    "ERR wrong number of arguments " +
+                    "for 'cluster|meet' command");
+            }
+
+            var host = GetString(args[2]);
+
+            var nodesText = ClusterMeetClient.FetchNodesText(
+                host,
+                port,
+                TimeSpan.FromSeconds(3));
+
+            if (nodesText is null)
+            {
+                return Error(
+                    $"ERR Could not connect to node at {host}:{port}");
+            }
+
+            _cluster!.MergeNodesText(nodesText);
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private ValueTask<RespValue> ClusterReplicate(
+            IReadOnlyList<RespValue> args)
+        {
+            if (args.Count != 3)
+            {
+                return Error(
+                    "ERR wrong number of arguments " +
+                    "for 'cluster|replicate' command");
+            }
+
+            var masterId = GetString(args[2]);
+
+            if (_cluster!.GetNode(masterId) is null)
+                return Error($"ERR Unknown node {masterId}");
+
+            _cluster.SetRole(ClusterNodeRole.Replica, masterId);
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private RespValue ClusterInfo()
+        {
+            var self = _cluster!.Self;
+            var assigned = _cluster.SlotRanges()
+                .Sum(r => r.End - r.Start + 1);
+
+            var sb = new StringBuilder();
+
+            sb.Append("cluster_enabled:1\r\n");
+
+            sb.Append(
+                $"cluster_state:" +
+                $"{(assigned == HashSlot.SlotCount ? "ok" : "fail")}\r\n");
+
+            sb.Append($"cluster_slots_assigned:{assigned}\r\n");
+            sb.Append("cluster_slots_ok:" + assigned + "\r\n");
+            sb.Append("cluster_slots_pfail:0\r\n");
+            sb.Append("cluster_slots_fail:0\r\n");
+            sb.Append($"cluster_known_nodes:{_cluster.Nodes.Count}\r\n");
+
+            sb.Append(
+                "cluster_size:" +
+                $"{_cluster.Nodes.Count(n => n.Role == ClusterNodeRole.Master)}" +
+                "\r\n");
+
+            sb.Append($"cluster_current_epoch:{_cluster.CurrentEpoch}\r\n");
+            sb.Append($"cluster_my_epoch:{self.ConfigEpoch}\r\n");
+            sb.Append("cluster_stats_messages_sent:0\r\n");
+            sb.Append("cluster_stats_messages_received:0\r\n");
+            sb.Append("total_cluster_links_buffer_limit_exceeded:0\r\n");
+
+            return RespValue.Bulk(Encoding.UTF8.GetBytes(sb.ToString()));
+        }
+
+        private RespValue ClusterSlotsReply()
+        {
+            var result = new List<RespValue>();
+
+            foreach (var (start, end, nodeId) in _cluster!.SlotRanges())
+            {
+                var node = _cluster.GetNode(nodeId);
+
+                if (node is null)
+                    continue;
+
+                result.Add(RespValue.Array(new[]
+                {
+                    RespValue.Integer(start),
+                    RespValue.Integer(end),
+                    RespValue.Array(new[]
+                    {
+                        RespValue.Bulk(Encoding.UTF8.GetBytes(node.Host)),
+                        RespValue.Integer(node.Port),
+                        RespValue.Bulk(Encoding.UTF8.GetBytes(node.Id)),
+                        RespValue.Array(Array.Empty<RespValue>()),
+                    }),
+                }));
+            }
+
+            return RespValue.Array(result);
+        }
+
+        private RespValue ClusterShardsReply()
+        {
+            var result = new List<RespValue>();
+
+            foreach (var (start, end, nodeId) in _cluster!.SlotRanges())
+            {
+                var node = _cluster.GetNode(nodeId);
+
+                if (node is null)
+                    continue;
+
+                result.Add(RespValue.Array(new[]
+                {
+                    RespValue.Bulk(Encoding.UTF8.GetBytes("slots")),
+                    RespValue.Array(new[]
+                    {
+                        RespValue.Integer(start),
+                        RespValue.Integer(end),
+                    }),
+                    RespValue.Bulk(Encoding.UTF8.GetBytes("nodes")),
+                    RespValue.Array(new[]
+                    {
+                        RespValue.Array(new[]
+                        {
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes("id")),
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes(node.Id)),
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes("port")),
+                            RespValue.Integer(node.Port),
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes("ip")),
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes(node.Host)),
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes("role")),
+                            RespValue.Bulk(
+                                Encoding.UTF8.GetBytes(
+                                    node.Role == ClusterNodeRole.Master
+                                        ? "master"
+                                        : "replica")),
+                        }),
+                    }),
+                }));
+            }
+
+            return RespValue.Array(result);
         }
 
         private static ValueTask<RespValue> Command(

@@ -49,6 +49,7 @@ It speaks RESP2 over TCP, so existing Redis clients (`redis-cli`, StackExchange.
 - **Auth**: password-based `AUTH`, matching real Redis's `NOAUTH`/`WRONGPASS` semantics
 - **Transactions**: `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` — `EXEC` runs the whole queued batch under an exclusive lock for real cross-connection atomicity (this server isn't single-threaded like Redis, so that guarantee has to be built rather than assumed), and `WATCH` tracks real per-key versions rather than a coarse "anything changed" flag
 - **RedisInsight-compatible**: `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`, `INFO`, `CONFIG GET`, `CLIENT`, `MODULE LIST`
+- **Cluster mode**: hash-slot sharding across statically-configured nodes — `CLUSTER` commands, `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`, CRC16 slot hashing that matches real Redis key-for-key. See [Cluster mode](#cluster-mode) below for what's covered and what isn't yet.
 - **Logging**: rolling daily log files with automatic retention, alongside console output
 - Runs as a normal console app or as a Windows Service
 
@@ -135,6 +136,7 @@ recache/
   Server/           TCP accept loop (RecacheServer, a BackgroundService) and per-connection handling
   Security/         AUTH / password validation, per-connection session state
   Configuration/    RecacheOptions bound from appsettings.yaml
+  Clustering/       Hash-slot cluster mode: CRC16/slot math, ClusterState (topology + nodes.conf persistence), CLUSTER MEET's RESP-based bootstrap client
 scripts/            install-service.ps1 / uninstall-service.ps1 — for local dev/test service installs
 installer/          Inno Setup script (recache.iss) that builds the distributable installer
 .github/workflows/  CI: builds and pushes the Docker image on version tags
@@ -189,6 +191,43 @@ dotnet run -c Release -- --host 127.0.0.1 --port 6380 --password yourpassword --
 ```
 
 Reports SET/GET/PING throughput and p50/p95/p99 latency. `--pipeline N` batches N requests per round trip before reading replies, for throughput-oriented testing.
+
+### Cluster mode
+
+recache can shard keys across multiple statically-configured instances using the same 16384-slot model as real Redis Cluster — `CLUSTER KEYSLOT` returns the exact same slot number real Redis would for any given key (CRC16/XMODEM, with `{hashtag}` support for co-locating related keys), and `redis-cli -c` / cluster-aware client libraries get real `MOVED`/`ASK` redirection.
+
+**What's implemented**: `CLUSTER INFO/MYID/NODES/SLOTS/SHARDS/KEYSLOT/COUNTKEYSINSLOT/GETKEYSINSLOT/ADDSLOTS(RANGE)/DELSLOTS(RANGE)/SETSLOT/MEET/FORGET/REPLICATE/RESET/SET-CONFIG-EPOCH/BUMPEPOCH/SAVECONFIG`, plus `ASKING` and full `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN` enforcement on every key-bearing command. Node identity and slot ownership persist to a `nodes.conf`-style file across restarts.
+
+**What's not implemented yet**: there's no gossip/cluster-bus, so topology doesn't propagate automatically — `CLUSTER MEET` works by connecting to the peer over ordinary RESP and pulling its `CLUSTER NODES` view once (a real, working bootstrap, just not a live background sync). There's also no replication and no automatic failover; `CLUSTER REPLICATE`/`FAILOVER` exist mostly as bookkeeping. In short: manual, static multi-node sharding works end-to-end today; self-healing cluster behavior is future work.
+
+**Bring-up** (two nodes on localhost):
+
+```powershell
+# Terminal 1
+$env:Recache__ClusterEnabled = "true"
+$env:Recache__Port = "6380"
+$env:Recache__ClusterConfigFile = "node1-nodes.conf"
+dotnet run
+
+# Terminal 2
+$env:Recache__ClusterEnabled = "true"
+$env:Recache__Port = "6381"
+$env:Recache__ClusterConfigFile = "node2-nodes.conf"
+dotnet run
+```
+
+Then, against each node (e.g. with `redis-cli -p 6380` / `-p 6381`):
+
+```
+127.0.0.1:6380> CLUSTER ADDSLOTSRANGE 0 8191
+127.0.0.1:6381> CLUSTER ADDSLOTSRANGE 8192 16383
+127.0.0.1:6380> CLUSTER MEET 127.0.0.1 6381
+127.0.0.1:6381> CLUSTER MEET 127.0.0.1 6380
+```
+
+From here, `redis-cli -c -p 6380 SET somekey value` transparently follows any `MOVED` reply to the node that actually owns the key's slot. `CLUSTER NODES` on either node shows the full two-node topology.
+
+If either node isn't reachable at the address it was started with (containers, NAT, multiple NICs), set `Recache__ClusterAnnounceIp`/`Recache__ClusterAnnouncePort` so `MOVED`/`CLUSTER NODES` advertise an address peers can actually reach.
 
 ### License
 
