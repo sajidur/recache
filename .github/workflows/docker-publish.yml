@@ -1,7 +1,7 @@
 name: Docker Publish
 
 # Runs on GitHub's hosted runner, which has Docker built in —
-# builds and pushes sajidur/recache to Docker Hub. Fires on version
+# builds and pushes sajidur07/recache to Docker Hub. Fires on version
 # tags (v1.0.0, v1.2.3, ...); can also be run manually.
 on:
   push:
@@ -35,5 +35,5 @@ jobs:
           context: .
           push: true
           tags: |
-            sajidur/recache:${{ steps.version.outputs.version }}
-            sajidur/recache:latest
+            sajidur07/recache:${{ steps.version.outputs.version }}
+            sajidur07/recache:latest

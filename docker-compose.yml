@@ -1,6 +1,6 @@
 services:
   recache:
-    image: sajidur/recache:latest
+    image: sajidur07/recache:latest
     # Uncomment to build from source instead of pulling the image:
     # build: .
     container_name: recache

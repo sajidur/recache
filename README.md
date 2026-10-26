@@ -103,7 +103,7 @@ Settings live under `Recache:` in `appsettings.yaml` (see [`appsettings.example.
 
 ### Docker (Windows, macOS, or Linux)
 
-Prefer a container instead of the Windows installer? The image is on [Docker Hub](https://hub.docker.com/r/sajidur/recache):
+Prefer a container instead of the Windows installer? The image is on [Docker Hub](https://hub.docker.com/r/sajidur07/recache):
 
 ```bash
 docker run -d --name recache -p 6380:6380 \
@@ -111,7 +111,7 @@ docker run -d --name recache -p 6380:6380 \
   -e Recache__Password=yourpassword \
   -e Recache__EnableAof=true \
   -v recache-data:/data \
-  sajidur/recache:latest
+  sajidur07/recache:latest
 ```
 
 Or with Compose — grab [docker-compose.yml](docker-compose.yml), edit the password in it, then `docker compose up -d`.
@@ -375,7 +375,7 @@ docker run -d -p 6380:6380 -v recache-data:/data \
 
 The container needs no config file present — `RecacheOptions` has safe built-in defaults (auth disabled, port 6380), and `Recache__<Property>` environment variables override them. `.dockerignore` deliberately excludes `appsettings.yaml` so a real local password can never end up baked into an image layer.
 
-**Publishing to Docker Hub** happens via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) on any `v*.*.*` tag push (or manually via the Actions tab), pushing `sajidur/recache:<version>` and `:latest`. One-time setup: add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repo secrets.
+**Publishing to Docker Hub** happens via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) on any `v*.*.*` tag push (or manually via the Actions tab), pushing `sajidur07/recache:<version>` and `:latest`. One-time setup: add `DOCKERHUB_USERNAME` (`sajidur07`) and `DOCKERHUB_TOKEN` (a Docker Hub access token with Read & Write scope) as repo secrets.
 
 ### Benchmarking
 
