@@ -5,19 +5,19 @@ using System.Text;
 
 namespace recache.Protocol
 {
+    // Stream-based reader for client-side code (the benchmark, the
+    // CLUSTER MEET bootstrap, MIGRATE, the replication handshake,
+    // tests). Buffers whatever the stream has and parses whole
+    // values out of it synchronously with RespParser; only an empty
+    // buffer costs an await.
     public sealed class RespReader
     {
         private readonly Stream _stream;
         private readonly int _maxRequestBytes;
 
-        // Every read (byte-at-a-time parsing and bulk-string bodies
-        // alike) goes through this buffer instead of the stream
-        // directly. Without it, a single ~35-byte SET command meant
-        // 30+ individual async socket reads — one per byte — which
-        // dominates latency far more than actual command execution.
-        private readonly byte[] _buffer = new byte[8192];
-        private int _bufferStart;
-        private int _bufferEnd;
+        private byte[] _buffer = new byte[16 * 1024];
+        private int _start;
+        private int _end;
 
         public RespReader(
             Stream stream,
@@ -27,199 +27,150 @@ namespace recache.Protocol
             _maxRequestBytes = maxRequestBytes;
         }
 
+        // Bytes already read from the stream but not yet parsed —
+        // the start of whatever follows a handshake reply (e.g. the
+        // snapshot or command stream after +FULLRESYNC).
+        public ReadOnlyMemory<byte> Buffered =>
+            _buffer.AsMemory(_start, _end - _start);
+
+        public void ConsumeBuffered(int count)
+        {
+            _start += count;
+
+            if (_start == _end)
+                _start = _end = 0;
+        }
+
         public async ValueTask<RespValue?> ReadAsync(
             CancellationToken cancellationToken)
         {
-            var type = await ReadByteAsync(cancellationToken);
-
-            if (type == -1)
-                return null;
-
-            return type switch
-            {
-                '*' => await ReadArrayAsync(cancellationToken),
-                '$' => await ReadBulkStringAsync(cancellationToken),
-                '+' => RespValue.Simple(
-                    await ReadLineAsync(cancellationToken)),
-
-                '-' => RespValue.Error(
-                    await ReadLineAsync(cancellationToken)),
-
-                ':' => RespValue.Integer(
-                    long.Parse(
-                        await ReadLineAsync(cancellationToken))),
-
-                _ => throw new RespProtocolException(
-                    $"Unknown RESP type: {(char)type}")
-            };
-        }
-
-        private async ValueTask<RespValue> ReadArrayAsync(
-            CancellationToken cancellationToken)
-        {
-            var count = await ReadIntegerLineAsync(
-                cancellationToken);
-
-            if (count < 0)
-                return RespValue.NullArray();
-
-            if (count > 1024)
-                throw new RespProtocolException(
-                    "Too many array elements.");
-
-            var items = new RespValue[count];
-
-            for (var i = 0; i < count; i++)
-            {
-                var item = await ReadAsync(cancellationToken);
-
-                if (item == null)
-                    throw new EndOfStreamException();
-
-                items[i] = item;
-            }
-
-            return RespValue.Array(items);
-        }
-
-        private async ValueTask<RespValue> ReadBulkStringAsync(
-            CancellationToken cancellationToken)
-        {
-            var length = await ReadIntegerLineAsync(
-                cancellationToken);
-
-            if (length == -1)
-                return RespValue.Null();
-
-            if (length < 0 ||
-                length > _maxRequestBytes)
-            {
-                throw new RespProtocolException(
-                    "Bulk string too large.");
-            }
-
-            var buffer = GC.AllocateUninitializedArray<byte>(
-                checked((int)length));
-
-            await ReadExactlyAsync(
-                buffer,
-                cancellationToken);
-
-            await ExpectCrlfAsync(cancellationToken);
-
-            return RespValue.Bulk(buffer);
-        }
-
-        private async ValueTask<long> ReadIntegerLineAsync(
-            CancellationToken cancellationToken)
-        {
-            var line =
-                await ReadLineAsync(cancellationToken);
-
-            if (!long.TryParse(line, out var result))
-                throw new RespProtocolException(
-                    $"Invalid integer: {line}");
-
-            return result;
-        }
-
-        private async ValueTask<string> ReadLineAsync(
-            CancellationToken cancellationToken)
-        {
-            var buffer = new ArrayBufferWriter<byte>();
+            var needed = 0;
 
             while (true)
             {
-                var b = await ReadByteAsync(
+                if (_end > _start && _end - _start >= needed)
+                {
+                    var status = RespParser.TryParseValue(
+                        _buffer.AsSpan(_start, _end - _start),
+                        _maxRequestBytes,
+                        out var value,
+                        out var consumed,
+                        out needed,
+                        out var error);
+
+                    if (status == RespParseStatus.Complete)
+                    {
+                        ConsumeBuffered(consumed);
+                        return value;
+                    }
+
+                    if (status == RespParseStatus.Invalid)
+                        throw new RespProtocolException(error ?? "Protocol error");
+
+                    needed = Math.Max(needed, _end - _start + 1);
+                }
+
+                if (!await FillAsync(needed, cancellationToken))
+                {
+                    if (_end == _start)
+                        return null;
+
+                    throw new EndOfStreamException();
+                }
+            }
+        }
+
+        // Reads exactly `count` raw bytes (e.g. a snapshot payload
+        // that isn't CRLF-terminated) into `destination`.
+        public async ValueTask ReadExactlyAsync(
+            Stream destination,
+            long count,
+            CancellationToken cancellationToken)
+        {
+            while (count > 0)
+            {
+                if (_end == _start &&
+                    !await FillAsync(1, cancellationToken))
+                {
+                    throw new EndOfStreamException();
+                }
+
+                var take = (int)Math.Min(count, _end - _start);
+
+                await destination.WriteAsync(
+                    _buffer.AsMemory(_start, take),
                     cancellationToken);
 
-                if (b == -1)
-                    throw new EndOfStreamException();
+                ConsumeBuffered(take);
+                count -= take;
+            }
+        }
 
-                if (b == '\r')
+        // Reads one CRLF-terminated line without RESP-parsing it.
+        public async ValueTask<string?> ReadLineAsync(
+            CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                var span = _buffer.AsSpan(_start, _end - _start);
+                var lf = span.IndexOf((byte)'\n');
+
+                if (lf >= 0)
                 {
-                    var next = await ReadByteAsync(
-                        cancellationToken);
+                    var line = span[..lf];
 
-                    if (next != '\n')
-                        throw new RespProtocolException(
-                            "Invalid CRLF.");
+                    if (!line.IsEmpty && line[^1] == (byte)'\r')
+                        line = line[..^1];
 
-                    return Encoding.UTF8.GetString(
-                        buffer.WrittenSpan);
+                    var text = Encoding.UTF8.GetString(line);
+                    ConsumeBuffered(lf + 1);
+                    return text;
                 }
 
-                if (buffer.WrittenCount >= 64 * 1024)
-                    throw new RespProtocolException(
-                        "RESP line too long.");
+                if (_end - _start > 64 * 1024)
+                    throw new RespProtocolException("Line too long");
 
-                buffer.GetSpan(1)[0] = (byte)b;
-                buffer.Advance(1);
+                if (!await FillAsync(_end - _start + 1, cancellationToken))
+                    return null;
             }
         }
 
-        private async ValueTask<int> ReadByteAsync(
+        private async ValueTask<bool> FillAsync(
+            int needed,
             CancellationToken cancellationToken)
         {
-            if (_bufferStart == _bufferEnd &&
-                !await FillBufferAsync(cancellationToken))
+            if (_start > 0 && _end == _buffer.Length)
             {
-                return -1;
+                Buffer.BlockCopy(_buffer, _start, _buffer, 0, _end - _start);
+                _end -= _start;
+                _start = 0;
             }
 
-            return _buffer[_bufferStart++];
-        }
+            var required = Math.Max(needed, _end - _start + 1);
 
-        private async ValueTask ReadExactlyAsync(
-            Memory<byte> buffer,
-            CancellationToken cancellationToken)
-        {
-            var position = 0;
-
-            while (position < buffer.Length)
+            if (required > _buffer.Length - _start)
             {
-                if (_bufferStart == _bufferEnd &&
-                    !await FillBufferAsync(cancellationToken))
-                {
-                    throw new EndOfStreamException();
-                }
+                var size = _buffer.Length;
 
-                var available = _bufferEnd - _bufferStart;
-                var toCopy = Math.Min(
-                    available,
-                    buffer.Length - position);
+                while (size < required)
+                    size *= 2;
 
-                _buffer.AsSpan(_bufferStart, toCopy).CopyTo(
-                    buffer.Span.Slice(position, toCopy));
-
-                _bufferStart += toCopy;
-                position += toCopy;
+                var grown = new byte[size];
+                Buffer.BlockCopy(_buffer, _start, grown, 0, _end - _start);
+                _end -= _start;
+                _start = 0;
+                _buffer = grown;
             }
-        }
 
-        // Refills the internal buffer from the stream. Returns
-        // false at end of stream.
-        private async ValueTask<bool> FillBufferAsync(
-            CancellationToken cancellationToken)
-        {
-            _bufferEnd = await _stream.ReadAsync(
-                _buffer,
+            var read = await _stream.ReadAsync(
+                _buffer.AsMemory(_end),
                 cancellationToken);
 
-            _bufferStart = 0;
+            if (read == 0)
+                return false;
 
-            return _bufferEnd != 0;
-        }
-
-        private async ValueTask ExpectCrlfAsync(
-            CancellationToken cancellationToken)
-        {
-            var cr = await ReadByteAsync(cancellationToken);
-            var lf = await ReadByteAsync(cancellationToken);
-
-            if (cr != '\r' || lf != '\n')
-                throw new RespProtocolException(
-                    "Expected CRLF.");
+            _end += read;
+            return true;
         }
     }
 }

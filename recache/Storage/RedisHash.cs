@@ -5,7 +5,9 @@ namespace recache.Storage
 {
     public sealed class RedisHash
     {
-        private readonly Dictionary<string, byte[]> _fields =
+        // Segments itself once large, so a million-field hash never
+        // rehashes all of its fields in one go (see SegmentedDictionary).
+        private readonly SegmentedDictionary<string, byte[]> _fields =
             new(StringComparer.Ordinal);
 
         private readonly object _gate = new();
@@ -21,10 +23,9 @@ namespace recache.Storage
         {
             lock (_gate)
             {
-                if (_fields.TryGetValue(field, out var old))
+                if (!_fields.Set(field, value, out var old))
                 {
-                    byteDelta = value.Length - old.Length;
-                    _fields[field] = value;
+                    byteDelta = value.Length - old!.Length;
                     return false;
                 }
 
@@ -32,7 +33,6 @@ namespace recache.Storage
                     Encoding.UTF8.GetByteCount(field) +
                     value.Length;
 
-                _fields[field] = value;
                 return true;
             }
         }
@@ -59,7 +59,7 @@ namespace recache.Storage
         {
             lock (_gate)
             {
-                return _fields.TryGetValue(field, out value);
+                return _fields.TryGetValue(field, out value!);
             }
         }
 
@@ -80,7 +80,7 @@ namespace recache.Storage
 
                 var i = 0;
 
-                foreach (var kvp in _fields)
+                foreach (var kvp in _fields.Pairs)
                     result[i++] = kvp;
 
                 return result;

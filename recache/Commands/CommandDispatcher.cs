@@ -1,9 +1,14 @@
-﻿using recache.Clustering;
+using recache.Clustering;
 using recache.Configuration;
+using recache.Monitoring;
+using recache.Persistence;
 using recache.Protocol;
+using recache.Replication;
 using recache.Security;
+using recache.Server;
 using recache.Storage;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -14,63 +19,61 @@ using System.Threading;
 
 namespace recache.Commands
 {
-    public sealed class CommandDispatcher
+    public sealed partial class CommandDispatcher
     {
+        // Returned by commands that write to the socket themselves
+        // (PSYNC hands the connection over to the replication code).
+        public static readonly RespValue NoReply = RespValue.Simple("<no reply>");
+
+        private static readonly RespValue SetName = RespValue.Bulk("SET");
+        private static readonly RespValue PxatName = RespValue.Bulk("PXAT");
+        private static readonly RespValue PexpireatName = RespValue.Bulk("PEXPIREAT");
+        private static readonly RespValue DelName = RespValue.Bulk("DEL");
+        private static readonly RespValue RestoreName = RespValue.Bulk("RESTORE");
+        private static readonly RespValue ReplaceName = RespValue.Bulk("REPLACE");
+        private static readonly RespValue AbsttlName = RespValue.Bulk("ABSTTL");
+        private static readonly RespValue MultiName = RespValue.Bulk("MULTI");
+        private static readonly RespValue ExecName = RespValue.Bulk("EXEC");
+
         private readonly ICacheStore _store;
         private readonly AuthenticationManager _auth;
         private readonly RecacheOptions _options;
         private readonly ClusterState? _cluster;
+        private readonly KeyLocks? _locks;
         private readonly string _runId;
         private readonly DateTimeOffset _startedAt;
-
-        // Every command normally takes the read lock — many can run
-        // concurrently, matching today's behaviour. EXEC takes the
-        // write lock for its whole batch, giving transactions real
-        // atomicity against other connections despite this server
-        // not being single-threaded like real Redis.
-        //
-        // Safe only because every command handler below completes
-        // synchronously (ValueTask.FromResult, no real await) — the
-        // lock is always entered and exited on the same thread. If
-        // a command ever needs genuine async I/O, this needs an
-        // async-aware lock instead of ReaderWriterLockSlim.
-        private readonly ReaderWriterLockSlim _executionLock =
-            new(LockRecursionPolicy.NoRecursion);
-
-        private static readonly HashSet<string> KnownCommands =
-            new(StringComparer.Ordinal)
-            {
-                "PING", "GET", "SET", "SETEX", "PSETEX", "SETNX",
-                "STRLEN", "GETRANGE", "SETRANGE", "APPEND", "DEL",
-                "EXISTS", "INCR", "DECR", "INFO", "CLIENT", "CONFIG",
-                "COMMAND", "SELECT", "DBSIZE", "ECHO", "SCAN",
-                "HSCAN", "SSCAN", "ZSCAN", "TYPE", "TTL", "PTTL",
-                "EXPIRE", "PEXPIRE", "PERSIST", "HSET", "HGET",
-                "HGETALL", "HDEL", "HEXISTS", "HLEN", "HKEYS",
-                "HVALS", "HMGET", "LPUSH", "RPUSH", "LRANGE", "LLEN",
-                "LPOP", "RPOP", "LREM", "LSET", "LINDEX", "SADD",
-                "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "ZADD",
-                "ZREM", "ZSCORE", "ZRANGE", "ZCARD", "ZRANK",
-                "MODULE", "JSON.SET", "JSON.GET", "JSON.DEL",
-                "JSON.FORGET", "JSON.TYPE", "JSON.OBJKEYS",
-                "JSON.STRLEN", "JSON.ARRLEN", "JSON.OBJLEN",
-                "JSON.ARRAPPEND", "JSON.NUMINCRBY", "AUTH", "MULTI",
-                "EXEC", "DISCARD", "WATCH", "UNWATCH", "CLUSTER",
-            };
 
         public CommandDispatcher(
             ICacheStore store,
             AuthenticationManager auth,
             RecacheOptions options,
-            ClusterState? cluster = null)
+            ClusterState? cluster = null,
+            KeyLocks? locks = null)
         {
             _store = store;
             _auth = auth;
             _options = options;
             _cluster = cluster;
+            _locks = locks;
             _runId = Guid.NewGuid().ToString("N");
             _startedAt = DateTimeOffset.UtcNow;
         }
+
+        // Wired by RecacheNode after construction (several depend on
+        // the dispatcher in turn). All optional: the throwaway
+        // dispatcher that loads a replica's full-resync payload into a
+        // side store has none of them.
+        public ReplicationManager? Replication { get; set; }
+
+        public SnapshotService? Snapshots { get; set; }
+
+        public AofManager? Aof { get; set; }
+
+        public WriteGate? WriteGate { get; set; }
+
+        public RedisMetrics? Metrics { get; set; }
+
+        public ClusterManager? ClusterManager { get; set; }
 
         public ValueTask<RespValue> ExecuteAsync(
             RespValue request,
@@ -93,32 +96,372 @@ namespace recache.Commands
                         "ERR empty command"));
             }
 
-            var command =
-                GetString(args[0])
-                    .ToUpperInvariant();
+            Metrics?.CommandProcessed();
+
+            var info = LookupCommand(args[0]);
+
+            if (info is null)
+            {
+                if (session.InTransaction)
+                    session.TransactionDirty = true;
+
+                return Unknown(GetString(args[0]));
+            }
+
+            var command = info.Name;
 
             if (command == "AUTH")
                 return Auth(args, session);
 
-            if (_auth.RequiresAuth && !session.IsAuthenticated)
+            if (_auth.RequiresAuth &&
+                !session.IsAuthenticated &&
+                !session.IsMasterLink &&
+                command != "QUIT")
             {
                 return ValueTask.FromResult(
                     RespValue.Error(
                         "NOAUTH Authentication required."));
             }
 
+            if (!ArityMatches(info, args.Count))
+            {
+                if (session.InTransaction)
+                    session.TransactionDirty = true;
+
+                return Error(
+                    $"ERR wrong number of arguments for " +
+                    $"'{command.ToLowerInvariant()}' command");
+            }
+
+            if (session.InTransaction &&
+                (info.Flags & CommandFlags.NoMulti) != 0 &&
+                command != "WATCH")
+            {
+                session.TransactionDirty = true;
+                return Error("ERR Command not allowed inside a transaction");
+            }
+
+            if ((info.Flags & CommandFlags.Session) != 0)
+                return ExecuteSessionCommand(info, args, session, cancellationToken);
+
+            if (info.IsWrite &&
+                !session.IsMasterLink &&
+                _cluster is null &&
+                Replication is { IsReplica: true })
+            {
+                return Error(
+                    "READONLY You can't write against a read only replica.");
+            }
+
+            if (_cluster is not null && !session.IsMasterLink)
+            {
+                var redirect = CheckClusterRedirect(info, args, session);
+
+                if (redirect is not null)
+                {
+                    if (session.InTransaction)
+                        session.TransactionDirty = true;
+
+                    return ValueTask.FromResult(redirect);
+                }
+            }
+
+            if (session.InTransaction)
+            {
+                session.QueuedCommands.Add(request);
+
+                return ValueTask.FromResult(
+                    RespValue.Simple("QUEUED"));
+            }
+
+            return Execute(info, args, request, session, cancellationToken);
+        }
+
+        // Runs one command under the locks its keys require, then
+        // propagates it (to the AOF and replicas) if it changed
+        // anything — still holding those locks, so the stream records
+        // writes to any one key in exactly the order they were applied.
+        private ValueTask<RespValue> Execute(
+            CommandInfo info,
+            IReadOnlyList<RespValue> args,
+            RespValue request,
+            ClientSession session,
+            CancellationToken cancellationToken)
+        {
+            var gate = WriteGate;
+            var write = info.IsWrite;
+
+            if (gate is not null && gate.Blocks(write))
+                return RetryAfterPauseAsync(request, session, cancellationToken);
+
+            var locks = _locks;
+            var keys = info.HasKeys
+                ? info.GetKeyIndexes(args)
+                : Array.Empty<int>();
+
+            long offset = 0;
+            var paused = false;
+            RespValue reply;
+
+            if (locks is null || (keys.Count == 0 && (info.Flags & CommandFlags.AllKeys) == 0))
+            {
+                reply = RunCommand(info, args, session, ref offset);
+            }
+            else if ((info.Flags & CommandFlags.AllKeys) != 0)
+            {
+                locks.EnterAll();
+
+                try
+                {
+                    if (write && gate is not null && gate.Blocks(true))
+                    {
+                        paused = true;
+                        reply = RespValue.Ok;
+                    }
+                    else
+                    {
+                        if (write)
+                            Snapshots?.BeforeFlushAll();
+
+                        reply = RunCommand(info, args, session, ref offset);
+                    }
+                }
+                finally
+                {
+                    locks.ExitAll();
+                }
+            }
+            else if (keys.Count == 1)
+            {
+                var stripe = KeyLocks.StripeOf(KeyBytes(args[keys[0]]));
+
+                locks.Enter(stripe, write);
+
+                try
+                {
+                    if (write && gate is not null && gate.Blocks(true))
+                    {
+                        paused = true;
+                        reply = RespValue.Ok;
+                    }
+                    else
+                    {
+                        if (write)
+                            BeforeWrite(args, keys);
+
+                        reply = RunCommand(info, args, session, ref offset);
+                    }
+                }
+                finally
+                {
+                    locks.Exit(stripe, write);
+                }
+            }
+            else
+            {
+                Span<int> stripes = keys.Count <= 64
+                    ? stackalloc int[keys.Count]
+                    : new int[keys.Count];
+
+                for (var i = 0; i < keys.Count; i++)
+                    stripes[i] = KeyLocks.StripeOf(KeyBytes(args[keys[i]]));
+
+                var held = stripes[..KeyLocks.Normalize(stripes)];
+
+                locks.EnterMany(held, write);
+
+                try
+                {
+                    if (write && gate is not null && gate.Blocks(true))
+                    {
+                        paused = true;
+                        reply = RespValue.Ok;
+                    }
+                    else
+                    {
+                        if (write)
+                            BeforeWrite(args, keys);
+
+                        reply = RunCommand(info, args, session, ref offset);
+                    }
+                }
+                finally
+                {
+                    locks.ExitMany(held, write);
+                }
+            }
+
+            // Decided under the locks, acted on after releasing them:
+            // waiting on the pause while holding a key lock would
+            // deadlock against the pause's own drain.
+            if (paused)
+                return RetryAfterPauseAsync(request, session, cancellationToken);
+
+            // The connection holds the reply until the AOF covers this
+            // offset — once per batch, not per command (see
+            // ClientConnection).
+            if (offset > 0)
+                session.LastWriteOffset = offset;
+
+            return ValueTask.FromResult(reply);
+        }
+
+        private RespValue RunCommand(
+            CommandInfo info,
+            IReadOnlyList<RespValue> args,
+            ClientSession session,
+            ref long offset)
+        {
+            if (!info.IsWrite)
+                return DispatchAsync(info.Name, args, session).Result;
+
+            ExecutionScope.Dirty = 0;
+            ExecutionScope.PropagationOverride = null;
+
+            // Every handler completes synchronously (none awaits while
+            // holding key locks), so .Result never blocks.
+            var reply = DispatchAsync(info.Name, args, session).Result;
+
+            if (ExecutionScope.Dirty > 0 &&
+                Replication is { PropagationEnabled: true, Loading: false } replication)
+            {
+                offset = Propagate(replication.Backlog, info.Name, args);
+            }
+
+            ExecutionScope.PropagationOverride = null;
+            return reply;
+        }
+
+        private async ValueTask<RespValue> RetryAfterPauseAsync(
+            RespValue request,
+            ClientSession session,
+            CancellationToken cancellationToken)
+        {
+            await WriteGate!.WaitAsync().WaitAsync(cancellationToken);
+
+            // Everything is re-checked from the top — notably cluster
+            // slot ownership, which a coordinated failover changes
+            // while writes are paused.
+            return await ExecuteAsync(request, session, cancellationToken);
+        }
+
+        // Copy-on-write for an in-progress snapshot: capture each key's
+        // pre-image before this write changes it.
+        private void BeforeWrite(
+            IReadOnlyList<RespValue> args,
+            IReadOnlyList<int> keys)
+        {
+            var snapshots = Snapshots;
+
+            if (snapshots is null || !snapshots.InProgress)
+                return;
+
+            foreach (var index in keys)
+                snapshots.BeforeWrite(GetString(args[index]));
+        }
+
+        // Appends a write to the replication stream in deterministic
+        // form: anything relative to "now" (EXPIRE 10, SET ... EX 10,
+        // SETEX) is rewritten with the absolute instant this node
+        // actually stored, so the AOF replayed later — or a replica
+        // applying it a moment later — ends up with the same expiry.
+        private long Propagate(
+            ReplicationBacklog backlog,
+            string command,
+            IReadOnlyList<RespValue> args)
+        {
+            if (ExecutionScope.PropagationOverride is { } overrides)
+            {
+                long end = 0;
+
+                foreach (var replacement in overrides)
+                    end = backlog.AppendCommand(replacement);
+
+                return end;
+            }
+
+            return backlog.AppendCommand(RewriteForPropagation(command, args));
+        }
+
+        private IReadOnlyList<RespValue> RewriteForPropagation(
+            string command,
+            IReadOnlyList<RespValue> args)
+        {
             switch (command)
+            {
+                case "SET":
+                case "SETEX":
+                case "PSETEX":
+                {
+                    // The overwhelmingly common plain SET k v needs no
+                    // rewrite (and no extra lookup).
+                    if (command == "SET" && args.Count == 3)
+                        return args;
+
+                    if (!_store.TryGetExpireAt(GetString(args[1]), out var expiresAt))
+                        return args;
+
+                    var value = command == "SET" ? args[2] : args[3];
+
+                    return expiresAt is { } ms
+                        ? new[] { SetName, args[1], value, PxatName, RespValue.Bulk(ms.ToString(CultureInfo.InvariantCulture)) }
+                        : new[] { SetName, args[1], value };
+                }
+
+                case "EXPIRE":
+                case "PEXPIRE":
+                case "EXPIREAT":
+                case "PEXPIREAT":
+                {
+                    // A TTL in the past deleted the key.
+                    return _store.TryGetExpireAt(GetString(args[1]), out var expiresAt) &&
+                           expiresAt is { } ms
+                        ? new[] { PexpireatName, args[1], RespValue.Bulk(ms.ToString(CultureInfo.InvariantCulture)) }
+                        : new[] { DelName, args[1] };
+                }
+
+                case "RESTORE":
+                case "RESTORE-ASKING":
+                {
+                    if (!_store.TryGetExpireAt(GetString(args[1]), out var expiresAt))
+                        return args;
+
+                    return expiresAt is { } ms
+                        ? new[] { RestoreName, args[1], RespValue.Bulk(ms.ToString(CultureInfo.InvariantCulture)), args[3], ReplaceName, AbsttlName }
+                        : new[] { RestoreName, args[1], RespValue.Bulk("0"), args[3], ReplaceName };
+                }
+
+                default:
+                    return args;
+            }
+        }
+
+        private ValueTask<RespValue> ExecuteSessionCommand(
+            CommandInfo info,
+            IReadOnlyList<RespValue> args,
+            ClientSession session,
+            CancellationToken cancellationToken)
+        {
+            switch (info.Name)
             {
                 case "MULTI":
                     return HandleMulti(session);
 
                 case "EXEC":
-                    return HandleExec(session);
+                    return HandleExec(session, cancellationToken);
 
                 case "DISCARD":
                     return HandleDiscard(session);
 
                 case "WATCH":
+                    if (_cluster is not null)
+                    {
+                        var redirect = CheckClusterRedirect(info, args, session);
+
+                        if (redirect is not null)
+                            return ValueTask.FromResult(redirect);
+                    }
+
                     return HandleWatch(args, session);
 
                 case "UNWATCH":
@@ -128,48 +471,596 @@ namespace recache.Commands
                 case "ASKING":
                     session.Asking = true;
                     return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "READONLY":
+                    if (_cluster is null)
+                    {
+                        return Error(
+                            "ERR This instance has cluster support disabled");
+                    }
+
+                    session.ReadOnlyMode = true;
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "READWRITE":
+                    session.ReadOnlyMode = false;
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "QUIT":
+                    session.Handoff = SessionHandoff.Close;
+                    return ValueTask.FromResult(RespValue.Simple("OK"));
+
+                case "WAIT":
+                    return Wait(args, session, cancellationToken);
+
+                case "PSYNC":
+                case "SYNC":
+                    return HandlePsync(args, session);
+
+                default:
+                    return Unknown(info.Name);
+            }
+        }
+
+        private static ValueTask<RespValue> HandleMulti(
+            ClientSession session)
+        {
+            if (session.InTransaction)
+                return Error("ERR MULTI calls can not be nested");
+
+            session.InTransaction = true;
+            session.TransactionDirty = false;
+            session.QueuedCommands.Clear();
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private static ValueTask<RespValue> HandleDiscard(
+            ClientSession session)
+        {
+            if (!session.InTransaction)
+                return Error("ERR DISCARD without MULTI");
+
+            session.InTransaction = false;
+            session.TransactionDirty = false;
+            session.QueuedCommands.Clear();
+            session.WatchedKeys.Clear();
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        private ValueTask<RespValue> HandleWatch(
+            IReadOnlyList<RespValue> args,
+            ClientSession session)
+        {
+            if (args.Count < 2)
+            {
+                return Error(
+                    "ERR wrong number of arguments " +
+                    "for 'watch' command");
             }
 
+            if (session.InTransaction)
+                return Error("ERR WATCH inside MULTI is not allowed");
+
+            for (var i = 1; i < args.Count; i++)
+            {
+                var key = GetString(args[i]);
+                long? version = null;
+
+                WithKeyLock(key, write: false, () =>
+                {
+                    version = _store.TryGetVersion(key, out var current)
+                        ? current
+                        : null;
+                });
+
+                session.WatchedKeys[key] = version;
+            }
+
+            return ValueTask.FromResult(RespValue.Simple("OK"));
+        }
+
+        // Aborts with EXECABORT if a queue-time error dirtied the
+        // transaction; otherwise runs the whole batch atomically.
+        private ValueTask<RespValue> HandleExec(
+            ClientSession session,
+            CancellationToken cancellationToken)
+        {
+            if (!session.InTransaction)
+                return Error("ERR EXEC without MULTI");
+
+            session.InTransaction = false;
+
+            if (session.TransactionDirty)
+            {
+                session.TransactionDirty = false;
+                session.QueuedCommands.Clear();
+                session.WatchedKeys.Clear();
+
+                return Error(
+                    "EXECABORT Transaction discarded because of " +
+                    "previous errors.");
+            }
+
+            var queued = session.QueuedCommands.ToArray();
+            session.QueuedCommands.Clear();
+
+            var watched =
+                new Dictionary<string, long?>(session.WatchedKeys);
+
+            session.WatchedKeys.Clear();
+
+            return RunTransaction(queued, watched, session, cancellationToken);
+        }
+
+        // Executes the queued batch holding the locks of every key it
+        // touches (and every watched key) for its whole duration, so
+        // no other client — reader or writer — can observe it half
+        // applied; that's real cross-connection atomicity despite
+        // this server not being single-threaded like Redis. A failed
+        // WATCH aborts with a null array, matching real Redis.
+        private ValueTask<RespValue> RunTransaction(
+            RespValue[] queued,
+            Dictionary<string, long?> watched,
+            ClientSession session,
+            CancellationToken cancellationToken)
+        {
+            var infos = new CommandInfo[queued.Length];
+            var stripes = new List<int>();
+            var hasWrite = false;
+            var allKeys = false;
+
+            for (var i = 0; i < queued.Length; i++)
+            {
+                var commandArgs = queued[i].Items!;
+                var info = LookupCommand(commandArgs[0])!;
+
+                infos[i] = info;
+                hasWrite |= info.IsWrite;
+                allKeys |= (info.Flags & CommandFlags.AllKeys) != 0;
+
+                if (info.HasKeys)
+                {
+                    foreach (var index in info.GetKeyIndexes(commandArgs))
+                        stripes.Add(KeyLocks.StripeOf(KeyBytes(commandArgs[index])));
+                }
+            }
+
+            foreach (var key in watched.Keys)
+                stripes.Add(KeyLocks.StripeOf(key));
+
+            var gate = WriteGate;
+
+            if (hasWrite && gate is not null && gate.Blocks(true) && !session.IsMasterLink)
+                return RetryTransactionAfterPauseAsync(queued, watched, session, cancellationToken);
+
+            var held = stripes.ToArray();
+            var count = KeyLocks.Normalize(held);
+            var locks = _locks;
+            var paused = false;
+            long offset = 0;
+            RespValue reply;
+
+            if (locks is not null)
+            {
+                if (allKeys)
+                    locks.EnterAll();
+                else
+                    locks.EnterMany(held.AsSpan(0, count), write: true);
+            }
+
+            try
+            {
+                if (hasWrite && gate is not null && gate.Blocks(true) && !session.IsMasterLink)
+                {
+                    paused = true;
+                    reply = RespValue.Ok;
+                }
+                else if (WatchConflict(watched))
+                {
+                    reply = RespValue.NullArray();
+                }
+                else
+                {
+                    reply = ExecuteQueued(queued, infos, allKeys, session, ref offset);
+                }
+            }
+            finally
+            {
+                if (locks is not null)
+                {
+                    if (allKeys)
+                        locks.ExitAll();
+                    else
+                        locks.ExitMany(held.AsSpan(0, count), write: true);
+                }
+            }
+
+            if (paused)
+                return RetryTransactionAfterPauseAsync(queued, watched, session, cancellationToken);
+
+            if (offset > 0)
+                session.LastWriteOffset = offset;
+
+            return ValueTask.FromResult(reply);
+        }
+
+        private bool WatchConflict(Dictionary<string, long?> watched)
+        {
+            foreach (var (key, snapshotVersion) in watched)
+            {
+                var existsNow =
+                    _store.TryGetVersion(key, out var currentVersion);
+
+                var conflict = snapshotVersion.HasValue
+                    ? !existsNow ||
+                      currentVersion != snapshotVersion.Value
+                    : existsNow;
+
+                if (conflict)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private RespValue ExecuteQueued(
+            RespValue[] queued,
+            CommandInfo[] infos,
+            bool allKeys,
+            ClientSession session,
+            ref long offset)
+        {
+            var snapshots = Snapshots;
+
+            if (snapshots is { InProgress: true })
+            {
+                if (allKeys)
+                    snapshots.BeforeFlushAll();
+
+                for (var i = 0; i < queued.Length; i++)
+                {
+                    if (infos[i].IsWrite && infos[i].HasKeys)
+                        BeforeWrite(queued[i].Items!, infos[i].GetKeyIndexes(queued[i].Items!));
+                }
+            }
+
+            var replication = Replication;
+            var propagate = replication is { PropagationEnabled: true, Loading: false };
+            List<IReadOnlyList<RespValue>>? propagated = null;
+            var results = new RespValue[queued.Length];
+
+            for (var i = 0; i < queued.Length; i++)
+            {
+                var commandArgs = queued[i].Items!;
+
+                ExecutionScope.Dirty = 0;
+                ExecutionScope.PropagationOverride = null;
+
+                results[i] = DispatchAsync(infos[i].Name, commandArgs, session).Result;
+
+                if (propagate && infos[i].IsWrite && ExecutionScope.Dirty > 0)
+                {
+                    propagated ??= new List<IReadOnlyList<RespValue>>();
+
+                    if (ExecutionScope.PropagationOverride is { } overrides)
+                        propagated.AddRange(overrides);
+                    else
+                        propagated.Add(RewriteForPropagation(infos[i].Name, commandArgs));
+                }
+            }
+
+            ExecutionScope.PropagationOverride = null;
+
+            if (propagated is not null)
+                offset = AppendTransaction(replication!.Backlog, propagated);
+
+            return RespValue.Array(results);
+        }
+
+        // MULTI + commands + EXEC as one append, so neither a replica
+        // nor a snapshot can ever see part of a transaction.
+        private static long AppendTransaction(
+            ReplicationBacklog backlog,
+            List<IReadOnlyList<RespValue>> commands)
+        {
+            if (commands.Count == 1)
+                return backlog.AppendCommand(commands[0]);
+
+            var buffer = new ArrayBufferWriter<byte>(256 * (commands.Count + 2));
+
+            RespSerializer.WriteCommand(buffer, new[] { MultiName });
+
+            foreach (var command in commands)
+                RespSerializer.WriteCommand(buffer, command);
+
+            RespSerializer.WriteCommand(buffer, new[] { ExecName });
+
+            return backlog.Append(buffer.WrittenSpan);
+        }
+
+        private async ValueTask<RespValue> RetryTransactionAfterPauseAsync(
+            RespValue[] queued,
+            Dictionary<string, long?> watched,
+            ClientSession session,
+            CancellationToken cancellationToken)
+        {
+            await WriteGate!.WaitAsync().WaitAsync(cancellationToken);
+
+            // The pause may have been a failover that moved these slots
+            // elsewhere; if so the client must retry the whole
+            // transaction against the new owner.
             if (_cluster is not null)
             {
-                var redirect = CheckClusterRedirect(command, args, session);
+                foreach (var command in queued)
+                {
+                    var commandArgs = command.Items!;
+                    var info = LookupCommand(commandArgs[0])!;
+                    var redirect = CheckClusterRedirect(info, commandArgs, session);
 
-                if (redirect is not null)
-                    return ValueTask.FromResult(redirect);
+                    if (redirect is not null)
+                        return redirect;
+                }
+            }
+
+            return await RunTransaction(queued, watched, session, cancellationToken);
+        }
+
+        // Applies one command from a master's replication stream, or
+        // from an AOF / snapshot being loaded. Never re-propagated:
+        // `raw` (the command's exact bytes from the stream) is appended
+        // to this node's own stream instead — while the command's key
+        // locks are still held, like any write — so this node's offsets
+        // stay byte-identical to its master's. Empty when loading.
+        public RespValue ExecuteReplicated(
+            IReadOnlyList<RespValue> args,
+            ClientSession session,
+            ReadOnlySpan<byte> raw)
+        {
+            if (args.Count == 0)
+                return RespValue.Error("ERR empty command");
+
+            var backlog = raw.IsEmpty ? null : Replication?.Backlog;
+            var info = LookupCommand(args[0]);
+
+            if (info is null)
+            {
+                backlog?.Append(raw);
+                return RespValue.Error($"ERR unknown command '{GetString(args[0])}'");
+            }
+
+            switch (info.Name)
+            {
+                case "MULTI":
+                    session.InTransaction = true;
+                    session.QueuedCommands.Clear();
+                    session.ReplicatedTransactionBytes = backlog is null
+                        ? null
+                        : new ArrayBufferWriter<byte>(1024);
+
+                    session.ReplicatedTransactionBytes?.Write(raw);
+                    return RespValue.Ok;
+
+                case "EXEC":
+                    return ApplyReplicatedTransaction(session, raw);
+
+                case "DISCARD":
+                    session.InTransaction = false;
+                    session.QueuedCommands.Clear();
+                    session.ReplicatedTransactionBytes = null;
+                    backlog?.Append(raw);
+                    return RespValue.Ok;
+
+                case "PING":
+                case "SELECT":
+                case "REPLCONF":
+                    backlog?.Append(raw);
+                    return RespValue.Ok;
             }
 
             if (session.InTransaction)
             {
-                if (!KnownCommands.Contains(command))
-                {
-                    session.TransactionDirty = true;
-                    return Error($"ERR unknown command '{command}'");
-                }
-
-                session.QueuedCommands.Add(request);
-
-                return ValueTask.FromResult(
-                    RespValue.Simple("QUEUED"));
+                session.QueuedCommands.Add(RespValue.Array(args));
+                session.ReplicatedTransactionBytes?.Write(raw);
+                return RespValue.Simple("QUEUED");
             }
 
-            _executionLock.EnterReadLock();
+            var write = info.IsWrite;
+            var keys = info.HasKeys ? info.GetKeyIndexes(args) : Array.Empty<int>();
+            var locks = _locks;
+            var allKeys = (info.Flags & CommandFlags.AllKeys) != 0;
+            int[]? held = null;
+            var count = 0;
+
+            if (locks is not null)
+            {
+                if (allKeys)
+                {
+                    locks.EnterAll();
+                }
+                else if (keys.Count > 0)
+                {
+                    held = new int[keys.Count];
+
+                    for (var i = 0; i < keys.Count; i++)
+                        held[i] = KeyLocks.StripeOf(KeyBytes(args[keys[i]]));
+
+                    count = KeyLocks.Normalize(held);
+                    locks.EnterMany(held.AsSpan(0, count), write);
+                }
+            }
 
             try
             {
-                return DispatchAsync(command, args);
+                ExecutionScope.ApplyingReplicated = true;
+
+                if (write)
+                {
+                    if (allKeys)
+                        Snapshots?.BeforeFlushAll();
+                    else
+                        BeforeWrite(args, keys);
+                }
+
+                var reply = DispatchAsync(info.Name, args, session).Result;
+
+                backlog?.Append(raw);
+                return reply;
             }
             finally
             {
-                _executionLock.ExitReadLock();
+                ExecutionScope.ApplyingReplicated = false;
+
+                if (locks is not null)
+                {
+                    if (allKeys)
+                        locks.ExitAll();
+                    else if (held is not null)
+                        locks.ExitMany(held.AsSpan(0, count), write);
+                }
             }
         }
 
-        // MULTI/EXEC bookkeeping aside, this is identical to the
-        // body ExecuteAsync used to run directly — EXEC re-enters it
-        // once per queued command while holding the write lock.
+        private RespValue ApplyReplicatedTransaction(
+            ClientSession session,
+            ReadOnlySpan<byte> raw)
+        {
+            var backlog = raw.IsEmpty ? null : Replication?.Backlog;
+
+            if (!session.InTransaction)
+            {
+                backlog?.Append(raw);
+                return RespValue.Error("ERR EXEC without MULTI");
+            }
+
+            session.InTransaction = false;
+
+            var bytes = session.ReplicatedTransactionBytes;
+            session.ReplicatedTransactionBytes = null;
+            bytes?.Write(raw);
+
+            var queued = session.QueuedCommands.ToArray();
+            session.QueuedCommands.Clear();
+
+            var infos = new CommandInfo[queued.Length];
+            var stripes = new List<int>();
+            var allKeys = false;
+
+            for (var i = 0; i < queued.Length; i++)
+            {
+                var commandArgs = queued[i].Items!;
+                var info = LookupCommand(commandArgs[0]);
+
+                if (info is null)
+                    return RespValue.Error("ERR unknown command in replicated transaction");
+
+                infos[i] = info;
+                allKeys |= (info.Flags & CommandFlags.AllKeys) != 0;
+
+                if (info.HasKeys)
+                {
+                    foreach (var index in info.GetKeyIndexes(commandArgs))
+                        stripes.Add(KeyLocks.StripeOf(KeyBytes(commandArgs[index])));
+                }
+            }
+
+            var held = stripes.ToArray();
+            var count = KeyLocks.Normalize(held);
+            var locks = _locks;
+
+            if (locks is not null)
+            {
+                if (allKeys)
+                    locks.EnterAll();
+                else
+                    locks.EnterMany(held.AsSpan(0, count), write: true);
+            }
+
+            try
+            {
+                ExecutionScope.ApplyingReplicated = true;
+
+                var snapshots = Snapshots;
+
+                if (snapshots is { InProgress: true })
+                {
+                    if (allKeys)
+                        snapshots.BeforeFlushAll();
+
+                    for (var i = 0; i < queued.Length; i++)
+                    {
+                        if (infos[i].IsWrite && infos[i].HasKeys)
+                            BeforeWrite(queued[i].Items!, infos[i].GetKeyIndexes(queued[i].Items!));
+                    }
+                }
+
+                var results = new RespValue[queued.Length];
+
+                for (var i = 0; i < queued.Length; i++)
+                    results[i] = DispatchAsync(infos[i].Name, queued[i].Items!, session).Result;
+
+                if (bytes is not null)
+                    backlog?.Append(bytes.WrittenSpan);
+
+                return RespValue.Array(results);
+            }
+            finally
+            {
+                ExecutionScope.ApplyingReplicated = false;
+
+                if (locks is not null)
+                {
+                    if (allKeys)
+                        locks.ExitAll();
+                    else
+                        locks.ExitMany(held.AsSpan(0, count), write: true);
+                }
+            }
+        }
+
+        // Runs `action` holding one key's stripe lock.
+        private void WithKeyLock(string key, bool write, Action action)
+        {
+            if (_locks is null)
+            {
+                action();
+                return;
+            }
+
+            var stripe = KeyLocks.StripeOf(key);
+
+            _locks.Enter(stripe, write);
+
+            try
+            {
+                action();
+            }
+            finally
+            {
+                _locks.Exit(stripe, write);
+            }
+        }
+
+        private static CommandInfo? LookupCommand(RespValue name)
+            => name.BinaryValue is { } bytes
+                ? CommandTable.Lookup(bytes)
+                : CommandTable.Lookup(name.StringValue ?? "");
+
+        private static bool ArityMatches(CommandInfo info, int count)
+            => info.Arity >= 0
+                ? count == info.Arity
+                : count >= -info.Arity;
+
+        private static ReadOnlySpan<byte> KeyBytes(RespValue value)
+            => value.BinaryValue ?? Encoding.UTF8.GetBytes(value.StringValue ?? "");
+
+        // MULTI/EXEC bookkeeping aside, this is the per-command switch.
+        // Every handler completes synchronously.
         private ValueTask<RespValue> DispatchAsync(
             string command,
-            IReadOnlyList<RespValue> args)
+            IReadOnlyList<RespValue> args,
+            ClientSession? session)
         {
             try
             {
@@ -195,7 +1086,7 @@ namespace recache.Commands
 
                     "APPEND" => Append(args),
 
-                    "DEL" => Del(args),
+                    "DEL" or "UNLINK" => Del(args),
 
                     "EXISTS" => Exists(args),
 
@@ -203,15 +1094,23 @@ namespace recache.Commands
 
                     "DECR" => Increment(args, -1),
 
+                    "INCRBY" => IncrementBy(args, negate: false),
+
+                    "DECRBY" => IncrementBy(args, negate: true),
+
+                    "MGET" => MGet(args),
+
+                    "MSET" => MSet(args),
+
                     "INFO" => Info(args),
 
-                    "CLIENT" => Client(args),
+                    "CLIENT" => Client(args, session),
 
                     "CONFIG" => Config(args),
 
                     "COMMAND" => Command(args),
 
-                    "CLUSTER" => Cluster(args),
+                    "CLUSTER" => Cluster(args, session),
 
                     "SELECT" => Select(args),
 
@@ -220,7 +1119,11 @@ namespace recache.Commands
 
                     "ECHO" => Echo(args),
 
+                    "TIME" => Time(),
+
                     "SCAN" => Scan(args),
+
+                    "KEYS" => KeysCommand(args),
 
                     "HSCAN" => HScan(args),
 
@@ -234,13 +1137,31 @@ namespace recache.Commands
 
                     "PTTL" => PTtl(args),
 
+                    "EXPIRETIME" => ExpireTime(args, milliseconds: false),
+
+                    "PEXPIRETIME" => ExpireTime(args, milliseconds: true),
+
                     "EXPIRE" => Expire(args),
 
                     "PEXPIRE" => PExpire(args),
 
+                    "EXPIREAT" => ExpireAt(args, milliseconds: false),
+
+                    "PEXPIREAT" => ExpireAt(args, milliseconds: true),
+
                     "PERSIST" => Persist(args),
 
+                    "DUMP" => Dump(args),
+
+                    "RESTORE" or "RESTORE-ASKING" => Restore(args),
+
+                    "MIGRATE" => Migrate(args),
+
+                    "FLUSHALL" or "FLUSHDB" => FlushAll(args),
+
                     "HSET" => HSet(args),
+
+                    "HMSET" => HMSet(args),
 
                     "HGET" => HGet(args),
 
@@ -329,6 +1250,16 @@ namespace recache.Commands
 
                     "JSON.NUMINCRBY" => JsonNumIncrBy(args),
 
+                    "BGREWRITEAOF" => BgRewriteAof(),
+
+                    "SHUTDOWN" => Shutdown(),
+
+                    "REPLICAOF" or "SLAVEOF" => ReplicaOf(args),
+
+                    "ROLE" => Role(),
+
+                    "REPLCONF" => ReplConf(args, session),
+
                     _ => Unknown(command)
                 };
             }
@@ -340,134 +1271,9 @@ namespace recache.Commands
             {
                 return Error($"ERR {ex.Message}");
             }
-        }
-
-        private static ValueTask<RespValue> HandleMulti(
-            ClientSession session)
-        {
-            if (session.InTransaction)
-                return Error("ERR MULTI calls can not be nested");
-
-            session.InTransaction = true;
-            session.TransactionDirty = false;
-            session.QueuedCommands.Clear();
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        private static ValueTask<RespValue> HandleDiscard(
-            ClientSession session)
-        {
-            if (!session.InTransaction)
-                return Error("ERR DISCARD without MULTI");
-
-            session.InTransaction = false;
-            session.TransactionDirty = false;
-            session.QueuedCommands.Clear();
-            session.WatchedKeys.Clear();
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        private ValueTask<RespValue> HandleWatch(
-            IReadOnlyList<RespValue> args,
-            ClientSession session)
-        {
-            if (args.Count < 2)
+            catch (CommandErrorException ex)
             {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'watch' command");
-            }
-
-            if (session.InTransaction)
-                return Error("ERR WATCH inside MULTI is not allowed");
-
-            for (var i = 1; i < args.Count; i++)
-            {
-                var key = GetString(args[i]);
-
-                session.WatchedKeys[key] =
-                    _store.TryGetVersion(key, out var version)
-                        ? version
-                        : null;
-            }
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        // Executes the whole queued batch under the exclusive write
-        // lock, giving real cross-connection atomicity. Aborts with
-        // EXECABORT if a queue-time error dirtied the transaction,
-        // or with a null array if a watched key changed underneath
-        // it — both match real Redis's EXEC semantics.
-        private ValueTask<RespValue> HandleExec(ClientSession session)
-        {
-            if (!session.InTransaction)
-                return Error("ERR EXEC without MULTI");
-
-            session.InTransaction = false;
-
-            if (session.TransactionDirty)
-            {
-                session.TransactionDirty = false;
-                session.QueuedCommands.Clear();
-                session.WatchedKeys.Clear();
-
-                return Error(
-                    "EXECABORT Transaction discarded because of " +
-                    "previous errors.");
-            }
-
-            var queued = session.QueuedCommands.ToArray();
-            session.QueuedCommands.Clear();
-
-            var watched =
-                new Dictionary<string, long?>(session.WatchedKeys);
-
-            session.WatchedKeys.Clear();
-
-            _executionLock.EnterWriteLock();
-
-            try
-            {
-                foreach (var (key, snapshotVersion) in watched)
-                {
-                    var existsNow =
-                        _store.TryGetVersion(key, out var currentVersion);
-
-                    var conflict = snapshotVersion.HasValue
-                        ? !existsNow ||
-                          currentVersion != snapshotVersion.Value
-                        : existsNow;
-
-                    if (conflict)
-                        return ValueTask.FromResult(RespValue.NullArray());
-                }
-
-                var results = new RespValue[queued.Length];
-
-                for (var i = 0; i < queued.Length; i++)
-                {
-                    var commandArgs = queued[i].Items!;
-
-                    var commandName =
-                        GetString(commandArgs[0]).ToUpperInvariant();
-
-                    // Every handler completes synchronously (see
-                    // the comment on _executionLock), so this never
-                    // actually awaits — it's safe to read .Result
-                    // immediately without yielding the thread that
-                    // holds the write lock.
-                    results[i] =
-                        DispatchAsync(commandName, commandArgs).Result;
-                }
-
-                return ValueTask.FromResult(RespValue.Array(results));
-            }
-            finally
-            {
-                _executionLock.ExitWriteLock();
+                return Error(ex.Message);
             }
         }
 
@@ -528,10 +1334,8 @@ namespace recache.Commands
                 return Error(
                     "ERR wrong number of arguments for GET");
 
-            var key = GetString(args[1]);
-
             if (!_store.TryGet(
-                key,
+                KeyBytes(args[1]),
                 out var value))
             {
                 return ValueTask.FromResult(
@@ -555,7 +1359,16 @@ namespace recache.Commands
             var key = GetString(args[1]);
             var value = GetBytes(args[2]);
 
-            TimeSpan? expiry = null;
+            if (args.Count == 3)
+            {
+                _store.Set(key, value);
+                return ValueTask.FromResult(RespValue.Ok);
+            }
+
+            // Absolute Unix-ms expiry: EX/PX are relative to now,
+            // EXAT/PXAT (what the AOF and replication stream carry)
+            // are absolute.
+            long? expiry = null;
             string? condition = null;
             var keepTtl = false;
             var getOld = false;
@@ -564,7 +1377,7 @@ namespace recache.Commands
             {
                 var option = GetString(args[i]).ToUpperInvariant();
 
-                if (option == "EX" || option == "PX")
+                if (option is "EX" or "PX" or "EXAT" or "PXAT")
                 {
                     if (expiry.HasValue || keepTtl)
                         return Error("ERR syntax error");
@@ -576,13 +1389,16 @@ namespace recache.Commands
                         amount <= 0)
                     {
                         return Error(
-                            "ERR value is not an integer " +
-                            "or out of range");
+                            "ERR invalid expire time in 'set' command");
                     }
 
-                    expiry = option == "EX"
-                        ? TimeSpan.FromSeconds(amount)
-                        : TimeSpan.FromMilliseconds(amount);
+                    expiry = option switch
+                    {
+                        "EX" => CacheStore.NowMs + amount * 1000,
+                        "PX" => CacheStore.NowMs + amount,
+                        "EXAT" => amount * 1000,
+                        _ => amount,
+                    };
                 }
                 else if (option == "NX" || option == "XX")
                 {
@@ -612,7 +1428,7 @@ namespace recache.Commands
             // conditional create — this is exactly SETNX.
             if (condition == "NX" && !getOld && !keepTtl)
             {
-                var didSet = _store.SetIfAbsent(key, value, expiry);
+                var didSet = _store.SetIfAbsentWithExpireAt(key, value, expiry);
 
                 return ValueTask.FromResult(
                     didSet
@@ -643,12 +1459,10 @@ namespace recache.Commands
             if (condition == "XX" && !exists)
                 return ValueTask.FromResult(RespValue.Null());
 
-            TimeSpan? preservedTtl = null;
-
             if (keepTtl)
-                _store.TryGetTtl(key, out preservedTtl);
-
-            _store.Set(key, value, expiry ?? preservedTtl);
+                _store.SetKeepTtl(key, value);
+            else
+                _store.SetWithExpireAt(key, value, expiry);
 
             return ValueTask.FromResult(
                 getOld
@@ -804,9 +1618,9 @@ namespace recache.Commands
             Array.Copy(patch, 0, result, (int)offset, patch.Length);
 
             // SETRANGE modifies in place — unlike a plain SET, it
-            // must not clear an existing TTL.
-            _store.TryGetTtl(key, out var ttl);
-            _store.Set(key, result, ttl);
+            // must not clear an existing TTL (or nudge it: the exact
+            // absolute expiry is kept, so replicas agree).
+            _store.SetKeepTtl(key, result);
 
             return ValueTask.FromResult(RespValue.Integer(newLen));
         }
@@ -846,8 +1660,7 @@ namespace recache.Commands
 
             // Same as SETRANGE: an in-place modification, so any
             // existing TTL must be preserved.
-            _store.TryGetTtl(key, out var ttl);
-            _store.Set(key, result, ttl);
+            _store.SetKeepTtl(key, result);
 
             return ValueTask.FromResult(RespValue.Integer(result.Length));
         }
@@ -965,33 +1778,23 @@ namespace recache.Commands
                 }
             }
 
-            // Simplified cursor: an index into a stable, sorted
-            // snapshot of the current key set. This does not give
-            // Redis's exact "every key present for the whole scan
-            // is returned at least once under concurrent mutation"
-            // guarantee, but is correct and stable for the common
-            // case of browsing a mostly-static keyspace.
-            var snapshot = new List<string>(_store.Keys);
-            snapshot.Sort(StringComparer.Ordinal);
-
-            var start = (int)Math.Min(cursor, snapshot.Count);
-            var end = (int)Math.Min(start + count, snapshot.Count);
-
+            // Pages through one keyspace shard at a time (see
+            // CacheStore.ScanKeys), so a SCAN call costs a fraction of
+            // the keyspace instead of sorting all of it.
+            var batch = _store.ScanKeys(cursor, count, out var nextCursor);
             var page = new List<RespValue>();
 
-            for (var i = start; i < end; i++)
+            foreach (var key in batch)
             {
-                var key = snapshot[i];
-
                 if (matchPattern != null &&
                     !GlobMatch(matchPattern, key))
                 {
                     continue;
                 }
 
-                // Skip keys that expired since the snapshot
-                // was taken, without materializing their value.
-                if (!_store.TryGetType(key, out var keyType))
+                // Skip expired keys — without deleting them: SCAN
+                // holds no key locks, and only lock holders may.
+                if (!_store.IsLive(key, out var keyType))
                     continue;
 
                 if (typeFilter != null &&
@@ -1007,9 +1810,6 @@ namespace recache.Commands
                     RespValue.Bulk(
                         Encoding.UTF8.GetBytes(key)));
             }
-
-            var nextCursor =
-                end >= snapshot.Count ? 0 : end;
 
             return ValueTask.FromResult(
                 RespValue.Array(new RespValue[]
@@ -2037,12 +2837,12 @@ namespace recache.Commands
             }
 
             var snapshot = hash.Snapshot();
-            var result = new RespValue[snapshot.Length];
+            var values = new byte[snapshot.Length][];
 
             for (var i = 0; i < snapshot.Length; i++)
-                result[i] = RespValue.Bulk(snapshot[i].Value);
+                values[i] = snapshot[i].Value;
 
-            return ValueTask.FromResult(RespValue.Array(result));
+            return ValueTask.FromResult(RespValue.BulkArray(values));
         }
 
         private ValueTask<RespValue> HMGet(
@@ -2126,13 +2926,10 @@ namespace recache.Commands
                     RespValue.Array(Array.Empty<RespValue>()));
             }
 
-            var items = list.Range(start, stop);
-            var result = new RespValue[items.Length];
-
-            for (var i = 0; i < items.Length; i++)
-                result[i] = RespValue.Bulk(items[i]);
-
-            return ValueTask.FromResult(RespValue.Array(result));
+            // Range already copies the element references out under the
+            // list's lock; reply with that array as-is.
+            return ValueTask.FromResult(
+                RespValue.BulkArray(list.Range(start, stop)));
         }
 
         private ValueTask<RespValue> LLen(
@@ -2348,13 +3145,7 @@ namespace recache.Commands
                     RespValue.Array(Array.Empty<RespValue>()));
             }
 
-            var snapshot = set.Snapshot();
-            var result = new RespValue[snapshot.Length];
-
-            for (var i = 0; i < snapshot.Length; i++)
-                result[i] = RespValue.Bulk(snapshot[i]);
-
-            return ValueTask.FromResult(RespValue.Array(result));
+            return ValueTask.FromResult(RespValue.BulkArray(set.Snapshot()));
         }
 
         private ValueTask<RespValue> SIsMember(
@@ -2405,30 +3196,60 @@ namespace recache.Commands
             }
 
             var key = GetString(args[1]);
+
+            // Validate every score before touching the key — an
+            // invalid one must not leave a half-applied (or freshly
+            // created, empty) sorted set behind.
+            var scores = new double[(args.Count - 2) / 2];
+
+            for (var i = 2; i < args.Count; i += 2)
+            {
+                if (!TryParseScore(GetString(args[i]), out scores[(i - 2) / 2]))
+                    return Error("ERR value is not a valid float");
+            }
+
             var zset = _store.GetOrCreateSortedSet(key);
 
             var added = 0;
 
             for (var i = 2; i < args.Count; i += 2)
             {
-                if (!double.TryParse(
-                        GetString(args[i]),
-                        NumberStyles.Float,
-                        CultureInfo.InvariantCulture,
-                        out var score))
-                {
-                    return Error("ERR value is not a valid float");
-                }
-
                 var member = GetString(args[i + 1]);
 
-                if (zset.Add(member, score, out var delta))
+                if (zset.Add(member, scores[(i - 2) / 2], out var delta))
                     added++;
 
                 _store.AdjustMemory(key, delta);
             }
 
             return ValueTask.FromResult(RespValue.Integer(added));
+        }
+
+        // Accepts Redis's spellings of infinity as well as .NET's (a
+        // rewritten AOF formats scores with "R", which round-trips).
+        private static bool TryParseScore(string text, out double score)
+        {
+            switch (text.ToLowerInvariant())
+            {
+                case "inf":
+                case "+inf":
+                case "infinity":
+                case "+infinity":
+                    score = double.PositiveInfinity;
+                    return true;
+
+                case "-inf":
+                case "-infinity":
+                    score = double.NegativeInfinity;
+                    return true;
+            }
+
+            return double.TryParse(
+                       text,
+                       NumberStyles.Float,
+                       CultureInfo.InvariantCulture,
+                       out score) &&
+                   !double.IsNaN(score);
         }
 
         private ValueTask<RespValue> ZRem(
@@ -2597,800 +3418,6 @@ namespace recache.Commands
                    !double.IsInfinity(score)
                 ? ((long)score).ToString(CultureInfo.InvariantCulture)
                 : score.ToString("R", CultureInfo.InvariantCulture);
-        }
-
-        private ValueTask<RespValue> Info(
-            IReadOnlyList<RespValue> args)
-        {
-            var uptime =
-                (long)(DateTimeOffset.UtcNow - _startedAt)
-                    .TotalSeconds;
-
-            var sb = new StringBuilder();
-
-            sb.Append("# Server\r\n");
-            sb.Append("redis_version:7.4.0\r\n");
-
-            sb.Append(
-                $"redis_mode:{(_cluster is null ? "standalone" : "cluster")}\r\n");
-
-            sb.Append($"os:{Environment.OSVersion}\r\n");
-            sb.Append("arch_bits:64\r\n");
-            sb.Append($"process_id:{Environment.ProcessId}\r\n");
-            sb.Append($"run_id:{_runId}\r\n");
-            sb.Append($"tcp_port:{_options.Port}\r\n");
-            sb.Append($"uptime_in_seconds:{uptime}\r\n");
-
-            sb.Append("\r\n# Clients\r\n");
-            sb.Append("connected_clients:1\r\n");
-
-            sb.Append("\r\n# Memory\r\n");
-            sb.Append($"used_memory:{_store.MemoryBytes}\r\n");
-            sb.Append($"used_memory_human:{_store.MemoryBytes}B\r\n");
-            sb.Append($"maxmemory:{_options.MaxMemoryBytes}\r\n");
-            sb.Append("maxmemory_policy:noeviction\r\n");
-
-            sb.Append("\r\n# Persistence\r\n");
-            sb.Append("loading:0\r\n");
-            sb.Append(
-                $"aof_enabled:{(_options.EnableAof ? 1 : 0)}\r\n");
-
-            sb.Append("\r\n# Stats\r\n");
-            sb.Append("total_connections_received:0\r\n");
-            sb.Append("total_commands_processed:0\r\n");
-
-            sb.Append("\r\n# Replication\r\n");
-
-            sb.Append(
-                $"role:{(_cluster is { Self.Role: ClusterNodeRole.Replica } ? "slave" : "master")}\r\n");
-
-            sb.Append("connected_slaves:0\r\n");
-
-            if (_cluster is not null)
-            {
-                sb.Append("\r\n# Cluster\r\n");
-                sb.Append("cluster_enabled:1\r\n");
-            }
-
-            sb.Append("\r\n# CPU\r\n");
-            sb.Append("used_cpu_sys:0.0\r\n");
-            sb.Append("used_cpu_user:0.0\r\n");
-
-            sb.Append("\r\n# Keyspace\r\n");
-
-            if (_store.Count > 0)
-            {
-                sb.Append(
-                    $"db0:keys={_store.Count},expires=0,avg_ttl=0\r\n");
-            }
-
-            return ValueTask.FromResult(
-                RespValue.Bulk(
-                    Encoding.UTF8.GetBytes(sb.ToString())));
-        }
-
-        private ValueTask<RespValue> Client(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count < 2)
-            {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'client' command");
-            }
-
-            var sub = GetString(args[1]).ToUpperInvariant();
-
-            return sub switch
-            {
-                "SETNAME" or "SETINFO" or "NO-EVICT" or "NO-TOUCH" =>
-                    ValueTask.FromResult(RespValue.Simple("OK")),
-
-                "GETNAME" => ValueTask.FromResult(
-                    RespValue.Bulk(Array.Empty<byte>())),
-
-                "ID" => ValueTask.FromResult(
-                    RespValue.Integer(1)),
-
-                "LIST" or "INFO" => ValueTask.FromResult(
-                    RespValue.Bulk(Array.Empty<byte>())),
-
-                _ => Error(
-                    $"ERR Unknown CLIENT subcommand '{sub}'")
-            };
-        }
-
-        private static readonly IReadOnlyDictionary<string, string>
-            DefaultConfig = new Dictionary<string, string>(
-                StringComparer.OrdinalIgnoreCase)
-            {
-                ["maxmemory"] = "0",
-                ["maxmemory-policy"] = "noeviction",
-                ["appendonly"] = "no",
-                ["save"] = "",
-                ["timeout"] = "0",
-            };
-
-        private ValueTask<RespValue> Config(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count < 2)
-            {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'config' command");
-            }
-
-            var sub = GetString(args[1]).ToUpperInvariant();
-
-            if (sub == "GET")
-            {
-                if (args.Count != 3)
-                {
-                    return Error(
-                        "ERR wrong number of arguments " +
-                        "for 'config|get' command");
-                }
-
-                var pattern = GetString(args[2]);
-                var results = new List<RespValue>();
-
-                foreach (var kv in DefaultConfig)
-                {
-                    if (pattern == "*" ||
-                        string.Equals(
-                            pattern,
-                            kv.Key,
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        results.Add(
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes(kv.Key)));
-
-                        results.Add(
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes(kv.Value)));
-                    }
-                }
-
-                if (pattern == "databases")
-                {
-                    results.Add(
-                        RespValue.Bulk(
-                            Encoding.UTF8.GetBytes("databases")));
-
-                    results.Add(
-                        RespValue.Bulk(
-                            Encoding.UTF8.GetBytes(
-                                _options.DatabaseCount
-                                    .ToString())));
-                }
-
-                return ValueTask.FromResult(
-                    RespValue.Array(results));
-            }
-
-            if (sub == "SET")
-            {
-                return ValueTask.FromResult(
-                    RespValue.Simple("OK"));
-            }
-
-            return Error(
-                $"ERR Unknown CONFIG subcommand '{sub}'");
-        }
-
-        // Computes the slot for a key-bearing command's key(s) and
-        // decides whether this node is allowed to serve it. Returns
-        // null to let the command proceed normally.
-        private RespValue? CheckClusterRedirect(
-            string command,
-            IReadOnlyList<RespValue> args,
-            ClientSession session)
-        {
-            var keyIndexes = ClusterKeyMap.GetKeyIndexes(command, args.Count);
-
-            if (keyIndexes.Count == 0)
-                return null;
-
-            var asking = session.Asking;
-            session.Asking = false;
-
-            int? slot = null;
-
-            foreach (var index in keyIndexes)
-            {
-                var keySlot = HashSlot.Compute(GetString(args[index]));
-
-                if (slot is null)
-                    slot = keySlot;
-                else if (slot != keySlot)
-                {
-                    return RespValue.Error(
-                        "CROSSSLOT Keys in request don't hash to " +
-                        "the same slot");
-                }
-            }
-
-            var slotValue = slot!.Value;
-            var owner = _cluster!.GetOwner(slotValue);
-
-            if (owner is null)
-                return RespValue.Error("CLUSTERDOWN Hash slot not served");
-
-            if (owner.Id == _cluster.MyId)
-            {
-                var migration = _cluster.GetMigration(slotValue);
-
-                if (migration is { State: SlotMigrationState.Migrating } m &&
-                    keyIndexes.Count == 1 &&
-                    !_store.Exists(GetString(args[keyIndexes[0]])))
-                {
-                    var target = _cluster.GetNode(m.PeerNodeId);
-
-                    if (target is not null)
-                    {
-                        return RespValue.Error(
-                            $"ASK {slotValue} {target.Host}:{target.Port}");
-                    }
-                }
-
-                return null;
-            }
-
-            var importing = _cluster.GetMigration(slotValue);
-
-            if (asking &&
-                importing is { State: SlotMigrationState.Importing })
-            {
-                return null;
-            }
-
-            return RespValue.Error(
-                $"MOVED {slotValue} {owner.Host}:{owner.Port}");
-        }
-
-        private ValueTask<RespValue> Cluster(
-            IReadOnlyList<RespValue> args)
-        {
-            if (_cluster is null)
-            {
-                return Error(
-                    "ERR This instance has cluster support disabled");
-            }
-
-            if (args.Count < 2)
-            {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'cluster' command");
-            }
-
-            var sub = GetString(args[1]).ToUpperInvariant();
-
-            switch (sub)
-            {
-                case "MYID":
-                    return ValueTask.FromResult(
-                        RespValue.Bulk(
-                            Encoding.UTF8.GetBytes(_cluster.MyId)));
-
-                case "INFO":
-                    return ValueTask.FromResult(ClusterInfo());
-
-                case "NODES":
-                    return ValueTask.FromResult(
-                        RespValue.Bulk(
-                            Encoding.UTF8.GetBytes(
-                                _cluster.ToNodesText())));
-
-                case "SLOTS":
-                    return ValueTask.FromResult(ClusterSlotsReply());
-
-                case "SHARDS":
-                    return ValueTask.FromResult(ClusterShardsReply());
-
-                case "KEYSLOT":
-                    if (args.Count != 3)
-                    {
-                        return Error(
-                            "ERR wrong number of arguments " +
-                            "for 'cluster|keyslot' command");
-                    }
-
-                    return ValueTask.FromResult(
-                        RespValue.Integer(
-                            HashSlot.Compute(GetString(args[2]))));
-
-                case "COUNTKEYSINSLOT":
-                    return ClusterCountKeysInSlot(args);
-
-                case "GETKEYSINSLOT":
-                    return ClusterGetKeysInSlot(args);
-
-                case "ADDSLOTS":
-                    return ClusterAddSlots(args, ranges: false);
-
-                case "ADDSLOTSRANGE":
-                    return ClusterAddSlots(args, ranges: true);
-
-                case "DELSLOTS":
-                    return ClusterDelSlots(args, ranges: false);
-
-                case "DELSLOTSRANGE":
-                    return ClusterDelSlots(args, ranges: true);
-
-                case "SETSLOT":
-                    return ClusterSetSlot(args);
-
-                case "MEET":
-                    return ClusterMeet(args);
-
-                case "FORGET":
-                    if (args.Count != 3)
-                    {
-                        return Error(
-                            "ERR wrong number of arguments " +
-                            "for 'cluster|forget' command");
-                    }
-
-                    var forgetId = GetString(args[2]);
-
-                    return ValueTask.FromResult(
-                        _cluster.Forget(forgetId)
-                            ? RespValue.Simple("OK")
-                            : RespValue.Error(
-                                $"ERR Unknown node {forgetId}"));
-
-                case "REPLICATE":
-                    return ClusterReplicate(args);
-
-                case "RESET":
-                    var hard = args.Count >= 3 &&
-                        string.Equals(
-                            GetString(args[2]),
-                            "HARD",
-                            StringComparison.OrdinalIgnoreCase);
-
-                    _cluster.Reset(hard);
-
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                case "SET-CONFIG-EPOCH":
-                    if (args.Count != 3 ||
-                        !long.TryParse(GetString(args[2]), out var epoch))
-                    {
-                        return Error(
-                            "ERR Invalid config epoch specified: " +
-                            "must be a non-negative integer");
-                    }
-
-                    _cluster.SetConfigEpoch(epoch);
-
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                case "BUMPEPOCH":
-                    var newEpoch = _cluster.BumpEpoch();
-
-                    return ValueTask.FromResult(
-                        RespValue.Simple($"BUMPED {newEpoch}"));
-
-                case "SAVECONFIG":
-                    // ClusterState persists to ClusterConfigFile on
-                    // every mutation already, so there's nothing
-                    // extra to flush.
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                default:
-                    return Error(
-                        $"ERR Unknown CLUSTER subcommand '{sub}'");
-            }
-        }
-
-        private ValueTask<RespValue> ClusterCountKeysInSlot(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count != 3 ||
-                !int.TryParse(GetString(args[2]), out var slot) ||
-                slot < 0 ||
-                slot >= HashSlot.SlotCount)
-            {
-                return Error("ERR Invalid slot");
-            }
-
-            long count = 0;
-
-            foreach (var key in _store.Keys)
-            {
-                if (HashSlot.Compute(key) == slot)
-                    count++;
-            }
-
-            return ValueTask.FromResult(RespValue.Integer(count));
-        }
-
-        private ValueTask<RespValue> ClusterGetKeysInSlot(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count != 4 ||
-                !int.TryParse(GetString(args[2]), out var slot) ||
-                slot < 0 ||
-                slot >= HashSlot.SlotCount ||
-                !int.TryParse(GetString(args[3]), out var count) ||
-                count < 0)
-            {
-                return Error("ERR Invalid slot or count");
-            }
-
-            var result = new List<RespValue>();
-
-            foreach (var key in _store.Keys)
-            {
-                if (result.Count >= count)
-                    break;
-
-                if (HashSlot.Compute(key) == slot)
-                {
-                    result.Add(
-                        RespValue.Bulk(Encoding.UTF8.GetBytes(key)));
-                }
-            }
-
-            return ValueTask.FromResult(RespValue.Array(result));
-        }
-
-        private ValueTask<RespValue> ClusterAddSlots(
-            IReadOnlyList<RespValue> args,
-            bool ranges)
-        {
-            if (!TryParseSlotArgs(args, ranges, out var slots, out var err))
-                return Error(err!);
-
-            var busy = _cluster!.AddSlots(slots);
-
-            if (busy.Count > 0)
-            {
-                return Error(
-                    $"ERR Slot {busy[0]} is already busy");
-            }
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        private ValueTask<RespValue> ClusterDelSlots(
-            IReadOnlyList<RespValue> args,
-            bool ranges)
-        {
-            if (!TryParseSlotArgs(args, ranges, out var slots, out var err))
-                return Error(err!);
-
-            var free = _cluster!.RemoveSlots(slots);
-
-            if (free.Count > 0)
-            {
-                return Error(
-                    $"ERR Slot {free[0]} is already unassigned");
-            }
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        private static bool TryParseSlotArgs(
-            IReadOnlyList<RespValue> args,
-            bool ranges,
-            out List<int> slots,
-            out string? error)
-        {
-            slots = new List<int>();
-            error = null;
-
-            if (args.Count < 3 || (ranges && args.Count % 2 != 0))
-            {
-                error =
-                    "ERR wrong number of arguments for 'cluster' command";
-
-                return false;
-            }
-
-            if (ranges)
-            {
-                for (var i = 2; i < args.Count; i += 2)
-                {
-                    if (!TryParseSlot(GetString(args[i]), out var start) ||
-                        !TryParseSlot(
-                            GetString(args[i + 1]),
-                            out var end) ||
-                        start > end)
-                    {
-                        error = "ERR Invalid slot range";
-                        return false;
-                    }
-
-                    for (var slot = start; slot <= end; slot++)
-                        slots.Add(slot);
-                }
-            }
-            else
-            {
-                for (var i = 2; i < args.Count; i++)
-                {
-                    if (!TryParseSlot(GetString(args[i]), out var slot))
-                    {
-                        error = "ERR Invalid slot";
-                        return false;
-                    }
-
-                    slots.Add(slot);
-                }
-            }
-
-            return true;
-        }
-
-        private static bool TryParseSlot(string text, out int slot)
-        {
-            return int.TryParse(text, out slot) &&
-                slot >= 0 &&
-                slot < HashSlot.SlotCount;
-        }
-
-        private ValueTask<RespValue> ClusterSetSlot(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count < 4 ||
-                !TryParseSlot(GetString(args[2]), out var slot))
-            {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'cluster|setslot' command");
-            }
-
-            var mode = GetString(args[3]).ToUpperInvariant();
-
-            switch (mode)
-            {
-                case "MIGRATING":
-                    if (args.Count != 5)
-                        return Error("ERR wrong number of arguments");
-
-                    var migrateTarget = GetString(args[4]);
-
-                    if (_cluster!.GetNode(migrateTarget) is null)
-                        return Error($"ERR Unknown node {migrateTarget}");
-
-                    if (_cluster.GetOwner(slot)?.Id != _cluster.MyId)
-                    {
-                        return Error(
-                            $"ERR I'm not the owner of hash slot {slot}");
-                    }
-
-                    _cluster.SetMigrating(slot, migrateTarget);
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                case "IMPORTING":
-                    if (args.Count != 5)
-                        return Error("ERR wrong number of arguments");
-
-                    var importSource = GetString(args[4]);
-
-                    if (_cluster!.GetNode(importSource) is null)
-                        return Error($"ERR Unknown node {importSource}");
-
-                    if (_cluster.GetOwner(slot)?.Id == _cluster.MyId)
-                    {
-                        return Error(
-                            $"ERR I'm already the owner of hash " +
-                            $"slot {slot}");
-                    }
-
-                    _cluster.SetImporting(slot, importSource);
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                case "STABLE":
-                    _cluster!.ClearMigration(slot);
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                case "NODE":
-                    if (args.Count != 5)
-                        return Error("ERR wrong number of arguments");
-
-                    var owner = GetString(args[4]);
-
-                    if (_cluster!.GetNode(owner) is null)
-                        return Error($"ERR Unknown node {owner}");
-
-                    _cluster.AssignSlot(slot, owner);
-                    return ValueTask.FromResult(RespValue.Simple("OK"));
-
-                default:
-                    return Error(
-                        $"ERR Unknown CLUSTER SETSLOT mode '{mode}'");
-            }
-        }
-
-        private ValueTask<RespValue> ClusterMeet(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count < 4 ||
-                !int.TryParse(GetString(args[3]), out var port))
-            {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'cluster|meet' command");
-            }
-
-            var host = GetString(args[2]);
-
-            var nodesText = ClusterMeetClient.FetchNodesText(
-                host,
-                port,
-                TimeSpan.FromSeconds(3));
-
-            if (nodesText is null)
-            {
-                return Error(
-                    $"ERR Could not connect to node at {host}:{port}");
-            }
-
-            _cluster!.MergeNodesText(nodesText);
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        private ValueTask<RespValue> ClusterReplicate(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count != 3)
-            {
-                return Error(
-                    "ERR wrong number of arguments " +
-                    "for 'cluster|replicate' command");
-            }
-
-            var masterId = GetString(args[2]);
-
-            if (_cluster!.GetNode(masterId) is null)
-                return Error($"ERR Unknown node {masterId}");
-
-            _cluster.SetRole(ClusterNodeRole.Replica, masterId);
-
-            return ValueTask.FromResult(RespValue.Simple("OK"));
-        }
-
-        private RespValue ClusterInfo()
-        {
-            var self = _cluster!.Self;
-            var assigned = _cluster.SlotRanges()
-                .Sum(r => r.End - r.Start + 1);
-
-            var sb = new StringBuilder();
-
-            sb.Append("cluster_enabled:1\r\n");
-
-            sb.Append(
-                $"cluster_state:" +
-                $"{(assigned == HashSlot.SlotCount ? "ok" : "fail")}\r\n");
-
-            sb.Append($"cluster_slots_assigned:{assigned}\r\n");
-            sb.Append("cluster_slots_ok:" + assigned + "\r\n");
-            sb.Append("cluster_slots_pfail:0\r\n");
-            sb.Append("cluster_slots_fail:0\r\n");
-            sb.Append($"cluster_known_nodes:{_cluster.Nodes.Count}\r\n");
-
-            sb.Append(
-                "cluster_size:" +
-                $"{_cluster.Nodes.Count(n => n.Role == ClusterNodeRole.Master)}" +
-                "\r\n");
-
-            sb.Append($"cluster_current_epoch:{_cluster.CurrentEpoch}\r\n");
-            sb.Append($"cluster_my_epoch:{self.ConfigEpoch}\r\n");
-            sb.Append("cluster_stats_messages_sent:0\r\n");
-            sb.Append("cluster_stats_messages_received:0\r\n");
-            sb.Append("total_cluster_links_buffer_limit_exceeded:0\r\n");
-
-            return RespValue.Bulk(Encoding.UTF8.GetBytes(sb.ToString()));
-        }
-
-        private RespValue ClusterSlotsReply()
-        {
-            var result = new List<RespValue>();
-
-            foreach (var (start, end, nodeId) in _cluster!.SlotRanges())
-            {
-                var node = _cluster.GetNode(nodeId);
-
-                if (node is null)
-                    continue;
-
-                result.Add(RespValue.Array(new[]
-                {
-                    RespValue.Integer(start),
-                    RespValue.Integer(end),
-                    RespValue.Array(new[]
-                    {
-                        RespValue.Bulk(Encoding.UTF8.GetBytes(node.Host)),
-                        RespValue.Integer(node.Port),
-                        RespValue.Bulk(Encoding.UTF8.GetBytes(node.Id)),
-                        RespValue.Array(Array.Empty<RespValue>()),
-                    }),
-                }));
-            }
-
-            return RespValue.Array(result);
-        }
-
-        private RespValue ClusterShardsReply()
-        {
-            var result = new List<RespValue>();
-
-            foreach (var (start, end, nodeId) in _cluster!.SlotRanges())
-            {
-                var node = _cluster.GetNode(nodeId);
-
-                if (node is null)
-                    continue;
-
-                result.Add(RespValue.Array(new[]
-                {
-                    RespValue.Bulk(Encoding.UTF8.GetBytes("slots")),
-                    RespValue.Array(new[]
-                    {
-                        RespValue.Integer(start),
-                        RespValue.Integer(end),
-                    }),
-                    RespValue.Bulk(Encoding.UTF8.GetBytes("nodes")),
-                    RespValue.Array(new[]
-                    {
-                        RespValue.Array(new[]
-                        {
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes("id")),
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes(node.Id)),
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes("port")),
-                            RespValue.Integer(node.Port),
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes("ip")),
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes(node.Host)),
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes("role")),
-                            RespValue.Bulk(
-                                Encoding.UTF8.GetBytes(
-                                    node.Role == ClusterNodeRole.Master
-                                        ? "master"
-                                        : "replica")),
-                        }),
-                    }),
-                }));
-            }
-
-            return RespValue.Array(result);
-        }
-
-        private static ValueTask<RespValue> Command(
-            IReadOnlyList<RespValue> args)
-        {
-            if (args.Count >= 2)
-            {
-                var sub = GetString(args[1]).ToUpperInvariant();
-
-                if (sub == "COUNT")
-                {
-                    return ValueTask.FromResult(
-                        RespValue.Integer(0));
-                }
-
-                if (sub == "DOCS")
-                {
-                    return ValueTask.FromResult(
-                        RespValue.Array(Array.Empty<RespValue>()));
-                }
-            }
-
-            return ValueTask.FromResult(
-                RespValue.Array(Array.Empty<RespValue>()));
         }
 
         private ValueTask<RespValue> Select(

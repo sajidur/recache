@@ -20,12 +20,22 @@ WORKDIR /app
 COPY --from=build /app/publish .
 
 # /app is owned by root at this point (everything above ran as
-# root). Create the log directory and hand it to the non-root user
-# now, before switching — otherwise file logging fails with a
-# permission error at startup.
-RUN mkdir -p /app/logs && chown -R $APP_UID:$APP_UID /app/logs
+# root). Create the log and data directories and hand them to the
+# non-root user now, before switching — otherwise file logging, the
+# AOF and the cluster's nodes.conf fail with permission errors.
+RUN mkdir -p /app/logs /data && chown -R $APP_UID:$APP_UID /app/logs /data
 
-EXPOSE 6380
+# Everything that must survive a container restart lives in /data:
+# the append-only file and, in cluster mode, nodes.conf (this node's
+# identity and vote history). Mount a volume there.
+ENV Recache__AofPath=/data/appendonly.aof \
+    Recache__ClusterConfigFile=/data/nodes.conf
+
+VOLUME ["/data"]
+
+# 6380: clients. 16380: cluster bus (node-to-node; only needed with
+# Recache__ClusterEnabled=true, and should not be exposed publicly).
+EXPOSE 6380 16380
 
 # Runs as the non-root user built into the base image (identified
 # by $APP_UID, provided automatically) rather than root — port 6380

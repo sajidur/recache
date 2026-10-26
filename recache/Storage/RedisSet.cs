@@ -4,7 +4,9 @@ namespace recache.Storage
 {
     public sealed class RedisSet
     {
-        private readonly HashSet<byte[]> _members =
+        // Segments itself once large, so a huge set never rehashes all
+        // of its members in one go (see SegmentedDictionary).
+        private readonly SegmentedDictionary<byte[], byte> _members =
             new(ByteArrayComparer.Instance);
 
         private readonly object _gate = new();
@@ -18,8 +20,9 @@ namespace recache.Storage
         {
             lock (_gate)
             {
-                if (_members.Add(value))
+                if (!_members.ContainsKey(value))
                 {
+                    _members.Set(value, 0, out _);
                     byteDelta = value.Length;
                     return true;
                 }
@@ -33,7 +36,7 @@ namespace recache.Storage
         {
             lock (_gate)
             {
-                if (_members.Remove(value))
+                if (_members.Remove(value, out _))
                 {
                     byteDelta = -value.Length;
                     return true;
@@ -48,7 +51,7 @@ namespace recache.Storage
         {
             lock (_gate)
             {
-                return _members.Contains(value);
+                return _members.ContainsKey(value);
             }
         }
 
@@ -57,7 +60,11 @@ namespace recache.Storage
             lock (_gate)
             {
                 var result = new byte[_members.Count][];
-                _members.CopyTo(result);
+                var i = 0;
+
+                foreach (var pair in _members.Pairs)
+                    result[i++] = pair.Key;
+
                 return result;
             }
         }

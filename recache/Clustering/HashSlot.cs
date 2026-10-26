@@ -9,29 +9,37 @@ namespace recache.Clustering
 
         public static int Compute(string key)
         {
-            var tagged = ExtractHashTag(key);
-            var bytes = Encoding.UTF8.GetBytes(tagged);
+            if (key.Length <= 256)
+            {
+                Span<byte> bytes = stackalloc byte[Encoding.UTF8.GetMaxByteCount(key.Length)];
+                var count = Encoding.UTF8.GetBytes(key, bytes);
+                return Compute(bytes[..count]);
+            }
 
-            return Crc16.Compute(bytes) & (SlotCount - 1);
+            return Compute(Encoding.UTF8.GetBytes(key));
         }
+
+        // Straight from the request's key bytes — no string needed.
+        public static int Compute(ReadOnlySpan<byte> key)
+            => Crc16.Compute(ExtractHashTag(key)) & (SlotCount - 1);
 
         // Redis hashtag rule: if the key contains '{', and there is
         // a '}' after it with at least one character in between,
         // only that substring is hashed — lets callers co-locate
         // related keys onto the same slot deliberately.
-        private static string ExtractHashTag(string key)
+        private static ReadOnlySpan<byte> ExtractHashTag(ReadOnlySpan<byte> key)
         {
-            var open = key.IndexOf('{');
+            var open = key.IndexOf((byte)'{');
 
             if (open < 0)
                 return key;
 
-            var close = key.IndexOf('}', open + 1);
+            var close = key[(open + 1)..].IndexOf((byte)'}');
 
-            if (close <= open + 1)
+            if (close <= 0)
                 return key;
 
-            return key.Substring(open + 1, close - open - 1);
+            return key.Slice(open + 1, close);
         }
     }
 }

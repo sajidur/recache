@@ -1,8 +1,6 @@
 ﻿using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using recache.Commands;
 using recache.Configuration;
-using recache.Storage;
 using System;
 using System.Collections.Generic;
 using System.Net;
@@ -21,7 +19,7 @@ namespace recache.Server
     public sealed class RecacheServer : BackgroundService
     {
             private readonly RecacheOptions _options;
-            private readonly CommandDispatcher _dispatcher;
+            private readonly RecacheNode _node;
             private readonly ILogger<RecacheServer> _logger;
 
             private TcpListener? _listener;
@@ -30,17 +28,23 @@ namespace recache.Server
 
             public RecacheServer(
                 RecacheOptions options,
-                CommandDispatcher dispatcher,
+                RecacheNode node,
                 ILogger<RecacheServer> logger)
             {
                 _options = options;
-                _dispatcher = dispatcher;
+                _node = node;
                 _logger = logger;
             }
 
             protected override async Task ExecuteAsync(
                 CancellationToken stoppingToken)
             {
+                // Let StartAsync return (and the service report
+                // "running") before a potentially long AOF replay.
+                await Task.Yield();
+
+                _node.Start();
+
                 var bindAllInterfaces = _options.Host == "0.0.0.0";
 
                 // TcpListener bound to IPAddress.Any is IPv4-only.
@@ -58,7 +62,7 @@ namespace recache.Server
                     _listener.Server.DualMode = true;
 
                 _listener.Start(
-                    _options.MaxConnections);
+                    Math.Min(_options.MaxConnections, 4096));
 
                 _logger.LogInformation(
                     "Recache listening on {Host}:{Port}",
@@ -69,20 +73,24 @@ namespace recache.Server
                 {
                     while (!stoppingToken.IsCancellationRequested)
                     {
-                        TcpClient client;
+                        Socket socket;
 
                         try
                         {
-                            client =
-                                await _listener.AcceptTcpClientAsync(
+                            socket =
+                                await _listener.AcceptSocketAsync(
                                     stoppingToken);
                         }
                         catch (OperationCanceledException)
                         {
                             break;
                         }
+                        catch (SocketException)
+                        {
+                            continue;
+                        }
 
-                        client.NoDelay = true;
+                        socket.NoDelay = true;
 
                         if (Interlocked.Increment(
                                 ref _connections)
@@ -91,13 +99,14 @@ namespace recache.Server
                             Interlocked.Decrement(
                                 ref _connections);
 
-                            client.Dispose();
+                            _node.Metrics.ConnectionRejected();
+                            socket.Dispose();
 
                             continue;
                         }
 
                         _ = HandleClientAsync(
-                            client,
+                            socket,
                             stoppingToken);
                     }
                 }
@@ -107,17 +116,40 @@ namespace recache.Server
                 }
             }
 
+            public override async Task StopAsync(CancellationToken cancellationToken)
+            {
+                // Still accepting and serving here: during a cluster
+                // handover, clients that hit this node are redirected
+                // to the new owner instead of finding it gone.
+                try
+                {
+                    await _node.PrepareShutdownAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error handing over before shutdown");
+                }
+
+                await base.StopAsync(cancellationToken);
+
+                _node.Dispose();
+            }
+
             private async Task HandleClientAsync(
-                TcpClient client,
+                Socket socket,
                 CancellationToken cancellationToken)
             {
+                _node.Metrics.ClientConnected();
+
                 try
                 {
                     var connection =
                         new ClientConnection(
-                            client,
-                            _dispatcher,
-                            _options);
+                            socket,
+                            _node.Dispatcher,
+                            _options,
+                            _node.Replication,
+                            _node.Aof);
 
                     await connection.RunAsync(
                         cancellationToken);
@@ -136,7 +168,8 @@ namespace recache.Server
                     Interlocked.Decrement(
                         ref _connections);
 
-                    client.Dispose();
+                    _node.Metrics.ClientDisconnected();
+                    socket.Dispose();
                 }
             }
         }

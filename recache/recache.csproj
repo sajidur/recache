@@ -6,6 +6,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
+    <!-- Server GC: per-core heaps, and collections run on every core
+         in parallel instead of one thread. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+
+    <!-- All string handling is ordinal; no ICU needed (smaller image,
+         faster startup). -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,6 +24,18 @@
     <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Server GC's default adaptive sizing (DATAS) keeps young-gen
+         budgets small to save memory, so a write-heavy load collects
+         constantly; every collection also re-scans the long-lived
+         keyspace for references to new objects, a cost proportional
+         to the whole heap. Measured on 2M inserts: 27-33 collections
+         and 5-6 s of total pause with DATAS, 1 collection and 0.3 s
+         without. Costs more memory under load (garbage accumulates
+         longer); set DOTNET_GCDynamicAdaptationMode=1 to trade back. -->
+    <RuntimeHostConfigurationOption Include="System.GC.DynamicAdaptationMode" Value="0" />
   </ItemGroup>
 
   <ItemGroup>

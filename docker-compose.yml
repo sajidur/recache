@@ -11,7 +11,16 @@ services:
       # Recache__<Property> maps to the "Recache" section's property.
       Recache__RequireAuth: "true"
       Recache__Password: "changeme" # change this before real use
+
+      # Persist every write to /data/appendonly.aof (replayed on
+      # restart). "everysec" fsyncs once a second; "always" fsyncs
+      # before every reply.
+      Recache__EnableAof: "true"
+      Recache__AofFsync: "everysec"
     volumes:
+      # The AOF (and, in cluster mode, nodes.conf) — keep it across
+      # container recreation.
+      - recache-data:/data
       - recache-logs:/app/logs
 
       # To use a real config file instead of environment variables,
@@ -20,4 +29,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  recache-data:
   recache-logs:

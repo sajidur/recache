@@ -1,6 +1,10 @@
 # Copy this file to appsettings.yaml and set a real password before
 # running recache. appsettings.yaml is gitignored on purpose so a
 # real credential never ends up committed.
+#
+# Every setting can also be given as an environment variable
+# (Recache__Port=6381) or on the command line (--Recache:Port=6381);
+# those take precedence over this file.
 Recache:
   Host: "0.0.0.0"
   Port: 6380
@@ -10,17 +14,45 @@ Recache:
   MaxMemoryBytes: 4294967296
   RequireAuth: true
   Password: "CHANGE_THIS"
-  EnableAof: true
-  AofPath: "/data/appendonly.aof"
   DatabaseCount: 16
   EnableFileLogging: true
   LogDirectory: "logs"
   LogRetentionDays: 7
 
-  # Hash-slot cluster mode: CLUSTER commands, MOVED/ASK redirection,
-  # CROSSSLOT/CLUSTERDOWN enforcement. Off by default. See the
-  # "Cluster mode" section in README.md for a bring-up walkthrough.
+  # ---- Persistence (append-only file) ----
+  # Every write is appended to the AOF and replayed on startup.
+  EnableAof: true
+  # Relative paths are next to the executable.
+  AofPath: "data/appendonly.aof"
+  # always   = fsync before replying (no acknowledged write is ever lost)
+  # everysec = fsync once a second in the background (default)
+  # no       = let the OS decide
+  AofFsync: "everysec"
+  # Background rewrite (compaction) once the file has doubled since
+  # the last rewrite and is at least 64 MB. 0 disables it.
+  AofRewritePercentage: 100
+  AofRewriteMinBytes: 67108864
+  # Drop a half-written final command after a crash (true), or
+  # refuse to start so it can be inspected (false).
+  AofLoadTruncated: true
+
+  # ---- Replication (standalone) ----
+  # Start as a replica of another node ("host port"). Can also be
+  # changed at runtime with REPLICAOF host port / REPLICAOF NO ONE.
+  # ReplicaOf: "10.0.0.5 6380"
+  # MasterAuth: "..."                  # defaults to Password
+  ReplicationBacklogBytes: 67108864    # history kept for partial resyncs
+
+  # ---- Cluster ----
+  # Hash-slot sharding with gossip, automatic failover and
+  # zero-downtime handovers. See "Cluster mode" in README.md.
   ClusterEnabled: false
   ClusterConfigFile: "nodes.conf"
-  # ClusterAnnounceIp: "192.168.1.10"   # defaults to Host if unset
-  # ClusterAnnouncePort: 6380           # defaults to Port if unset
+  # ClusterAnnounceIp: "192.168.1.10"   # address peers/clients use for this node
+  # ClusterAnnouncePort: 6380
+  # ClusterBusPort: 16380               # defaults to Port + 10000
+  ClusterNodeTimeoutMs: 5000            # failure detection; failover takes ~1-2x this
+  ClusterFailoverOnShutdown: true       # hand slots to a replica before stopping
+  ClusterRequireFullCoverage: true
+  ClusterAllowReadsWhenDown: false
+  ClusterReplicaNoFailover: false

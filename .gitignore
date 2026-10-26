@@ -438,3 +438,4 @@ recache/appsettings.*.yaml
 
 # Runtime log output
 recache/logs/
+benchmark/compare-results.csv

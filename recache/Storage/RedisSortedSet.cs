@@ -28,7 +28,8 @@ namespace recache.Storage
             }
         }
 
-        private readonly Dictionary<string, Entry> _byMember =
+        // Segments itself once large (see SegmentedDictionary).
+        private readonly SegmentedDictionary<string, Entry> _byMember =
             new(StringComparer.Ordinal);
 
         private readonly SortedSet<Entry> _byScore = new(Comparer);
@@ -60,7 +61,7 @@ namespace recache.Storage
                     Score = score
                 };
 
-                _byMember[member] = entry;
+                _byMember.Set(member, entry, out _);
                 _byScore.Add(entry);
 
                 byteDelta =

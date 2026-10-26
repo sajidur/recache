@@ -6,18 +6,19 @@ using System.Text;
 
 namespace recache.Protocol
 {
+    // Stream-based writer for client-side code (the benchmark, the
+    // CLUSTER MEET bootstrap, MIGRATE, tests). The server's own
+    // connection loop serializes straight into its batched output
+    // buffer with RespSerializer instead.
     public sealed class RespWriter
     {
         private readonly Stream _stream;
 
         // A single connection's writes are always sequential (one
-        // reply is fully written, and awaited, before the next is
+        // write is fully issued, and awaited, before the next is
         // built), so it's safe to reuse one scratch buffer per
-        // writer instance. Every reply is serialized here in full
-        // and sent as exactly one stream write — previously a bulk
-        // string alone took three separate writes (length prefix,
-        // payload, CRLF), each its own TCP packet since NoDelay is
-        // set, and an array multiplied that per element.
+        // writer instance. Every value is serialized here in full
+        // and sent as exactly one stream write.
         private readonly ArrayBufferWriter<byte> _scratch = new();
 
         public RespWriter(Stream stream)
@@ -31,94 +32,32 @@ namespace recache.Protocol
         {
             _scratch.Clear();
 
-            Serialize(value, _scratch);
+            RespSerializer.Write(_scratch, value);
 
             return _stream.WriteAsync(
                 _scratch.WrittenMemory,
                 cancellationToken);
         }
 
-        private static void Serialize(
-            RespValue value,
-            ArrayBufferWriter<byte> buffer)
+        // Serializes several values into one write — how a client
+        // actually pipelines (one TCP send for the whole batch).
+        public ValueTask WriteManyAsync(
+            IEnumerable<RespValue> values,
+            CancellationToken cancellationToken)
         {
-            switch (value.Type)
-            {
-                case RespType.SimpleString:
+            _scratch.Clear();
 
-                    WriteLine(buffer, '+', value.StringValue!);
-                    break;
+            foreach (var value in values)
+                RespSerializer.Write(_scratch, value);
 
-                case RespType.Error:
-
-                    WriteLine(buffer, '-', value.StringValue!);
-                    break;
-
-                case RespType.Integer:
-
-                    WriteLine(
-                        buffer,
-                        ':',
-                        value.IntegerValue.ToString(
-                            CultureInfo.InvariantCulture));
-
-                    break;
-
-                case RespType.Null:
-
-                    WriteRaw(buffer, "$-1\r\n");
-                    break;
-
-                case RespType.NullArray:
-
-                    WriteRaw(buffer, "*-1\r\n");
-                    break;
-
-                case RespType.BulkString:
-
-                    var data = value.BinaryValue!;
-
-                    WriteRaw(buffer, $"${data.Length}\r\n");
-                    buffer.Write(data);
-                    WriteRaw(buffer, "\r\n");
-
-                    break;
-
-                case RespType.Array:
-
-                    WriteRaw(buffer, $"*{value.Items!.Count}\r\n");
-
-                    foreach (var item in value.Items)
-                        Serialize(item, buffer);
-
-                    break;
-
-                default:
-                    throw new InvalidOperationException();
-            }
-        }
-
-        private static void WriteLine(
-            ArrayBufferWriter<byte> buffer,
-            char prefix,
-            string text)
-        {
-            WriteRaw(buffer, $"{prefix}{text}\r\n");
-        }
-
-        private static void WriteRaw(
-            ArrayBufferWriter<byte> buffer,
-            string text)
-        {
-            var byteCount = Encoding.UTF8.GetByteCount(text);
-            var span = buffer.GetSpan(byteCount);
-            var written = Encoding.UTF8.GetBytes(text, span);
-            buffer.Advance(written);
+            return _stream.WriteAsync(
+                _scratch.WrittenMemory,
+                cancellationToken);
         }
 
         public ValueTask SimpleStringAsync(
-    string value,
-    CancellationToken cancellationToken = default)
+            string value,
+            CancellationToken cancellationToken = default)
         {
             return WriteAsync(
                 RespValue.Simple(value),
