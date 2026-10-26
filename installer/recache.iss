@@ -1,5 +1,5 @@
 #define MyAppName "Recache"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "Recache"
 #define MyAppExeName "recache.exe"
 #define MyServiceName "Recache"
@@ -23,7 +23,16 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 WizardStyle=modern
 
 [Files]
-Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Everything from the publish folder except configuration and runtime
+; state. `dotnet publish` copies the build machine's own
+; appsettings.yaml — a real password — into that folder; it must never
+; end up in a distributed installer.
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Excludes: "appsettings.yaml,\logs\*,\data\*,nodes.conf"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; The shipped configuration is always the redacted example
+; (placeholder password). onlyifdoesntexist: on an upgrade the
+; existing, already-configured appsettings.yaml is kept.
+Source: "..\recache\appsettings.example.yaml"; DestDir: "{app}"; DestName: "appsettings.yaml"; Flags: onlyifdoesntexist
 
 ; Service registration is done with direct sc.exe calls rather than
 ; shelling out to "powershell.exe -ExecutionPolicy Bypass -File ..."

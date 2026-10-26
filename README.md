@@ -356,11 +356,14 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
 ```powershell
 cd recache
-dotnet publish -c Release -o publish
+Remove-Item publish -Recurse -ErrorAction SilentlyContinue
+dotnet publish -c Release -r win-x64 --self-contained -o publish
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ..\installer\recache.iss
 ```
 
-Produces `installer\Output\RecacheSetup.exe`. It's unsigned by default — if you have a code-signing certificate, sign both `recache\publish\recache.exe` and the compiled installer with `signtool.exe` before distributing; without a certificate from a recognized CA, expect SmartScreen/AV false positives on other machines.
+Produces `installer\Output\RecacheSetup.exe`. The publish is self-contained (it carries the .NET runtime), so the installed service runs on machines without .NET installed. The installer never packages the build machine's own `appsettings.yaml` (which holds your real password): it always installs `appsettings.example.yaml` as `appsettings.yaml`, and keeps an existing one on upgrade.
+
+It's unsigned by default — if you have a code-signing certificate, sign `recache\publish\recache.exe` and `recache.dll` before compiling, and the compiled installer after, with `signtool.exe`; without a certificate from a recognized CA, expect SmartScreen/AV false positives on other machines.
 
 ### Docker
 
